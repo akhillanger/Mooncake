@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -188,6 +189,14 @@ Status NcclTransport::install(std::string& local_segment_name,
         conf_ ? conf_->get("transports/nccl/allow_external_window_buffers",
                            false)
               : false;
+    if (conf_) {
+        params_.max_concurrent_tasks =
+            conf_->get("transports/nccl/max_concurrent_tasks",
+                       params_.max_concurrent_tasks);
+    }
+    if (params_.max_concurrent_tasks == 0) params_.max_concurrent_tasks = 1;
+    shutting_down_.store(false, std::memory_order_release);
+    thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
 
     metadata_->setBootstrapNcclCallback(
         [this](const NcclBootstrapDesc& request, NcclBootstrapDesc& response) {
@@ -215,7 +224,8 @@ Status NcclTransport::install(std::string& local_segment_name,
 
     LOG(INFO) << "NCCL transport installed: version=" << nccl_version_
               << " allow_external_window_buffers="
-              << allow_external_window_buffers_;
+              << allow_external_window_buffers_
+              << " max_concurrent_tasks=" << params_.max_concurrent_tasks;
     return Status::OK();
 }
 
@@ -227,6 +237,9 @@ Status NcclTransport::uninstall() {
         metadata_->setNcclWindowCallback(nullptr);
         metadata_->setNcclSignalCallback(nullptr);
     }
+
+    shutting_down_.store(true, std::memory_order_release);
+    thread_pool_.reset();
 
     std::vector<std::thread> background_threads;
     {
@@ -326,10 +339,9 @@ Status NcclTransport::freeSubBatch(SubBatchRef& batch) {
     if (!nccl_batch)
         return Status::InvalidArgument("Invalid NCCL sub-batch" LOC_MARK);
     for (auto& task : nccl_batch->task_list) {
-        if (task.completion_event) {
-            cudaEventDestroy(task.completion_event);
-            task.completion_event = nullptr;
-        }
+        auto event = task.completion_event.exchange(
+            nullptr, std::memory_order_acq_rel);
+        if (event) cudaEventDestroy(event);
     }
     Slab<NcclSubBatch>::Get().deallocate(nccl_batch);
     batch = nullptr;
@@ -778,75 +790,126 @@ Status NcclTransport::onWaitNcclSignal(const NcclSignalDesc& request,
     return Status::OK();
 }
 
+void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
+    if (!task || !batch) return;
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        markFailed(*task, "NCCL transport shutting down");
+        return;
+    }
+
+    TransferContext ctx;
+    auto status = buildTransferContext(task->request, ctx);
+    std::shared_ptr<CommState> comm_state;
+    if (status.ok()) status = ensureComm(ctx, comm_state);
+    std::shared_ptr<WindowState> window_state;
+    if (status.ok()) status = ensureWindow(ctx, comm_state, window_state);
+    std::shared_ptr<WindowState> source_window_state;
+    if (status.ok()) {
+        status = ensureSourceWindow(ctx, comm_state, source_window_state);
+    }
+    if (status.ok()) status = postRemoteWaitSignal(ctx);
+    if (status.ok()) {
+        int previous_device = 0;
+        status = setCudaDevice(ctx.local_device, previous_device);
+        bool device_changed = status.ok();
+        cudaEvent_t event = nullptr;
+        if (status.ok()) {
+            status = ncclStatus(
+                ncclPutSignal(task->request.source, task->request.length,
+                              ncclUint8, comm_state->peer_rank,
+                              window_state->window, ctx.target_offset, 0, 0,
+                              0, comm_state->comm, batch->stream.get()),
+                "ncclPutSignal");
+            if (status.ok()) {
+                auto err = cudaEventCreateWithFlags(&event,
+                                                    cudaEventDisableTiming);
+                if (err != cudaSuccess) {
+                    status = Status::InternalError(
+                        std::string("cudaEventCreateWithFlags: ") +
+                        cudaGetErrorString(err) + LOC_MARK);
+                }
+            }
+            if (status.ok()) {
+                auto err = cudaEventRecord(event, batch->stream.get());
+                if (err != cudaSuccess) {
+                    status = Status::InternalError(
+                        std::string("cudaEventRecord: ") +
+                        cudaGetErrorString(err) + LOC_MARK);
+                }
+            }
+        }
+        if (device_changed) cudaSetDevice(previous_device);
+        if (status.ok()) {
+            task->completion_event.store(event, std::memory_order_release);
+            event = nullptr;
+        }
+        if (event) cudaEventDestroy(event);
+    }
+
+    if (!status.ok()) markFailed(*task, status.ToString());
+}
+
 Status NcclTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     auto nccl_batch = dynamic_cast<NcclSubBatch*>(batch);
     if (!nccl_batch)
         return Status::InvalidArgument("Invalid NCCL sub-batch" LOC_MARK);
+    if (!thread_pool_)
+        return Status::InternalError("NCCL transport is not installed" LOC_MARK);
     if (request_list.size() + nccl_batch->task_list.size() >
         nccl_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
 
+    std::vector<NcclTask*> new_tasks;
+    new_tasks.reserve(request_list.size());
     for (const auto& request : request_list) {
         nccl_batch->task_list.emplace_back();
         auto& task = nccl_batch->task_list.back();
         task.request = request;
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
+        task.transferred_bytes.store(0, std::memory_order_release);
+        task.completion_event.store(nullptr, std::memory_order_release);
 
         if (request.opcode == Request::READ) {
             CHECK_STATUS(markFailed(
                 task, "READ needs device-side ncclGinGet or delegated put"));
             continue;
         }
+        new_tasks.push_back(&task);
+    }
 
-        TransferContext ctx;
-        auto status = buildTransferContext(request, ctx);
-        std::shared_ptr<CommState> comm_state;
-        if (status.ok()) status = ensureComm(ctx, comm_state);
-        std::shared_ptr<WindowState> window_state;
-        if (status.ok()) status = ensureWindow(ctx, comm_state, window_state);
-        std::shared_ptr<WindowState> source_window_state;
-        if (status.ok()) {
-            status = ensureSourceWindow(ctx, comm_state, source_window_state);
-        }
-        if (status.ok()) status = postRemoteWaitSignal(ctx);
-        if (status.ok()) {
-            int previous_device = 0;
-            status = setCudaDevice(ctx.local_device, previous_device);
-            bool device_changed = status.ok();
-            if (status.ok()) {
-                status = ncclStatus(
-                    ncclPutSignal(request.source, request.length, ncclUint8,
-                                  comm_state->peer_rank, window_state->window,
-                                  ctx.target_offset, 0, 0, 0,
-                                  comm_state->comm,
-                                  nccl_batch->stream.get()),
-                    "ncclPutSignal");
-                if (status.ok()) {
-                    auto err = cudaEventCreateWithFlags(
-                        &task.completion_event, cudaEventDisableTiming);
-                    if (err != cudaSuccess) {
-                        status = Status::InternalError(
-                            std::string("cudaEventCreateWithFlags: ") +
-                            cudaGetErrorString(err) + LOC_MARK);
-                    }
-                }
-                if (status.ok()) {
-                    auto err = cudaEventRecord(task.completion_event,
-                                               nccl_batch->stream.get());
-                    if (err != cudaSuccess) {
-                        status = Status::InternalError(
-                            std::string("cudaEventRecord: ") +
-                            cudaGetErrorString(err) + LOC_MARK);
-                    }
+    if (new_tasks.empty()) return Status::OK();
+
+    auto task_ptrs = std::make_shared<std::vector<NcclTask*>>(
+        std::move(new_tasks));
+    try {
+        // Communicator and window setup can perform RPCs; keep it off the
+        // transfer-engine submission path.
+        thread_pool_->enqueue([this, nccl_batch, task_ptrs]() {
+            for (auto* task : *task_ptrs) {
+                try {
+                    startTransfer(task, nccl_batch);
+                } catch (const std::exception& e) {
+                    markFailed(
+                        *task, std::string("NCCL transfer worker failed: ") +
+                                   e.what());
+                } catch (...) {
+                    markFailed(*task, "NCCL transfer worker failed");
                 }
             }
-            if (device_changed) cudaSetDevice(previous_device);
+        });
+    } catch (const std::exception& e) {
+        for (auto* task : *task_ptrs) {
+            markFailed(
+                *task, std::string("NCCL submit worker enqueue failed: ") +
+                           e.what());
         }
-
-        if (!status.ok()) CHECK_STATUS(markFailed(task, status.ToString()));
+        return Status::InternalError(
+            std::string("NCCL submit worker enqueue failed: ") + e.what() +
+            LOC_MARK);
     }
+
     return Status::OK();
 }
 
@@ -861,8 +924,9 @@ Status NcclTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
     auto& task = nccl_batch->task_list[task_id];
     auto current = task.status_word.load(std::memory_order_acquire);
-    if (current == TransferStatusEnum::PENDING && task.completion_event) {
-        auto err = cudaEventQuery(task.completion_event);
+    auto event = task.completion_event.load(std::memory_order_acquire);
+    if (current == TransferStatusEnum::PENDING && event) {
+        auto err = cudaEventQuery(event);
         if (err == cudaSuccess) {
             task.transferred_bytes.store(task.request.length,
                                          std::memory_order_release);

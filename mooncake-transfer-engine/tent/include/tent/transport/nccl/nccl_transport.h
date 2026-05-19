@@ -30,6 +30,7 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 
+#include "tent/common/concurrent/thread_pool.h"
 #include "tent/platform/cuda.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
@@ -37,11 +38,15 @@
 namespace mooncake {
 namespace tent {
 
+struct NcclParams {
+    size_t max_concurrent_tasks = 4;
+};
+
 struct NcclTask {
     Request request;
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
-    cudaEvent_t completion_event = nullptr;
+    std::atomic<cudaEvent_t> completion_event{nullptr};
 
     NcclTask() = default;
     NcclTask(NcclTask&& other) noexcept
@@ -49,8 +54,8 @@ struct NcclTask {
           status_word(other.status_word.load(std::memory_order_relaxed)),
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
-          completion_event(other.completion_event) {
-        other.completion_event = nullptr;
+          completion_event(other.completion_event.exchange(
+              nullptr, std::memory_order_acq_rel)) {
     }
     NcclTask(const NcclTask&) = delete;
     NcclTask& operator=(const NcclTask&) = delete;
@@ -123,6 +128,7 @@ class NcclTransport : public Transport {
                                 NcclWindowDesc& response);
     Status onWaitNcclSignal(const NcclSignalDesc& request,
                             NcclSignalDesc& response);
+    void startTransfer(NcclTask* task, NcclSubBatch* batch);
     void startBackground(std::function<void()> fn);
 
    private:
@@ -134,6 +140,9 @@ class NcclTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<Config> conf_;
     CudaPlatform* platform_ = nullptr;
+    NcclParams params_;
+    std::unique_ptr<ThreadPool> thread_pool_;
+    std::atomic<bool> shutting_down_{false};
 
     mutable std::mutex allocation_mutex_;
     std::unordered_set<uint64_t> nccl_allocations_;

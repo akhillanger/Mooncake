@@ -90,7 +90,8 @@
         },
         "nccl": {
             "enable": false,
-            "allow_external_window_buffers": false
+            "allow_external_window_buffers": false,
+            "max_concurrent_tasks": 4
         }
     }
 }
