@@ -186,7 +186,7 @@ gpu_id + thread_id
 
 **Transport (TENT only)**
 
-* `--xport_type` : `rdma | shm | mnnvl | gds | iouring`
+* `--xport_type` : `rdma | shm | mnnvl | gds | iouring | nccl`
 
 **Metadata service**
 
