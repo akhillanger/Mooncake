@@ -243,12 +243,30 @@ Status NcclTransport::uninstall() {
             if (!window) continue;
             std::unique_lock<std::mutex> state_lock(window->mu);
             if (window->ready && window->window) {
+                std::shared_ptr<CommState> comm_state;
+                ncclComm_t comm = nullptr;
+                {
+                    std::lock_guard<std::mutex> comm_lock(comm_mutex_);
+                    auto comm_it = comms_.find(window->session_key);
+                    if (comm_it != comms_.end()) comm_state = comm_it->second;
+                }
+                if (comm_state) {
+                    std::lock_guard<std::mutex> comm_state_lock(
+                        comm_state->mu);
+                    if (comm_state->ready) comm = comm_state->comm;
+                }
+                if (!comm) {
+                    LOG(WARNING) << "Skipping NCCL window deregister without "
+                                    "ready communicator for session "
+                                 << window->session_key;
+                    continue;
+                }
                 int previous_device = 0;
                 auto status = setCudaDevice(window->device_index,
                                             previous_device);
                 if (status.ok()) {
-                    auto result = ncclCommWindowDeregister(
-                        comms_[window->session_key]->comm, window->window);
+                    auto result = ncclCommWindowDeregister(comm,
+                                                           window->window);
                     if (result != ncclSuccess)
                         LOG(WARNING) << "ncclCommWindowDeregister failed: "
                                      << ncclGetErrorString(result);
