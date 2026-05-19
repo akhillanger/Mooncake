@@ -55,6 +55,7 @@ enum TransportType : int {
     AscendDirect,
     SUNRISE_LINK,
     TPU,
+    NCCL,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
