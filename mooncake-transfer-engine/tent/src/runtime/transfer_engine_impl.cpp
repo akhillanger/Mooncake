@@ -1015,8 +1015,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                     if ((type == NVLINK || type == SHM || type == TPU) &&
                         !same_machine)
                         continue;
-                    if (type == NCCL && request.opcode == Request::READ)
-                        continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
                         raw.push_back(type);
@@ -1068,12 +1066,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.buffer_transports = &entry->transports;
     }
 
-    if (request.opcode == Request::READ) {
-        auto read_transports = transport_list_;
-        read_transports[NCCL].reset();
-        return transport_selector_->select(ctx, read_transports,
-                                           transport_index, hint);
-    }
     return transport_selector_->select(ctx, transport_list_, transport_index,
                                        hint);
 }

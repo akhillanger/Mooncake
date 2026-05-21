@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -30,6 +31,15 @@
 #include "tent/runtime/slab.h"
 #include "tent/runtime/topology.h"
 
+extern "C" cudaError_t tentNcclGinLaunchPut(
+    ncclDevComm_t dev_comm, int peer, ncclWindow_t dst_window,
+    size_t dst_offset, ncclWindow_t src_window, size_t src_offset,
+    size_t bytes, unsigned long long signal_value, cudaStream_t stream);
+
+extern "C" cudaError_t tentNcclGinLaunchWaitAck(
+    ncclDevComm_t dev_comm, int peer, unsigned long long signal_value,
+    cudaStream_t stream);
+
 namespace mooncake {
 namespace tent {
 namespace {
@@ -38,6 +48,12 @@ Status ncclStatus(ncclResult_t result, const char* expr) {
     if (result == ncclSuccess) return Status::OK();
     return Status::InternalError(std::string(expr) + ": " +
                                  ncclGetErrorString(result) + LOC_MARK);
+}
+
+Status cudaStatus(cudaError_t result, const char* expr) {
+    if (result == cudaSuccess) return Status::OK();
+    return Status::InternalError(std::string(expr) + ": " +
+                                 cudaGetErrorString(result) + LOC_MARK);
 }
 
 #define CHECK_NCCL(call)                       \
@@ -107,12 +123,22 @@ Status setCudaDevice(int device, int& previous_device) {
     return Status::OK();
 }
 
+size_t stripeOffset(size_t length, size_t lane, size_t lanes) {
+    return (length * lane) / lanes;
+}
+
 }  // namespace
 
 struct NcclTransport::CommState {
     std::mutex mu;
     std::condition_variable cv;
     ncclComm_t comm = nullptr;
+    ncclDevComm_t dev_comm{};
+    std::vector<ncclComm_t> lane_comms;
+    std::vector<ncclDevComm_t> lane_dev_comms;
+    std::vector<cudaStream_t> lane_streams;
+    std::atomic<uint64_t> signal_epoch{0};
+    size_t lanes = 1;
     Status status;
     bool initializing = false;
     bool ready = false;
@@ -125,6 +151,7 @@ struct NcclTransport::WindowState {
     std::mutex mu;
     std::condition_variable cv;
     ncclWindow_t window = nullptr;
+    std::vector<ncclWindow_t> lane_windows;
     void* local_buffer = nullptr;
     uint64_t length = 0;
     bool owns_local_buffer = false;
@@ -193,8 +220,12 @@ Status NcclTransport::install(std::string& local_segment_name,
         params_.max_concurrent_tasks =
             conf_->get("transports/nccl/max_concurrent_tasks",
                        params_.max_concurrent_tasks);
+        params_.gin_lanes =
+            conf_->get("transports/nccl/gin_lanes", params_.gin_lanes);
     }
     if (params_.max_concurrent_tasks == 0) params_.max_concurrent_tasks = 1;
+    if (params_.gin_lanes == 0) params_.gin_lanes = 1;
+    if (params_.gin_lanes > 16) params_.gin_lanes = 16;
     shutting_down_.store(false, std::memory_order_release);
     thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
 
@@ -217,15 +248,17 @@ Status NcclTransport::install(std::string& local_segment_name,
             return status.ok() ? 0 : -1;
         });
 
-    // Host-side NCCL RMA maps WRITE to ncclPutSignal. READ is skipped by the
-    // scheduler until device-side GIN get or delegated put is added.
+    // Device-side NCCL GIN maps both WRITE and READ to striped put+signal
+    // kernels. READ is served by delegating a peer put into the initiator's
+    // registered window.
     caps.gpu_to_gpu = true;
     installed_ = true;
 
     LOG(INFO) << "NCCL transport installed: version=" << nccl_version_
               << " allow_external_window_buffers="
               << allow_external_window_buffers_
-              << " max_concurrent_tasks=" << params_.max_concurrent_tasks;
+              << " max_concurrent_tasks=" << params_.max_concurrent_tasks
+              << " gin_lanes=" << params_.gin_lanes;
     return Status::OK();
 }
 
@@ -255,9 +288,9 @@ Status NcclTransport::uninstall() {
         for (auto& [_, window] : windows_) {
             if (!window) continue;
             std::unique_lock<std::mutex> state_lock(window->mu);
-            if (window->ready && window->window) {
+            if (window->ready && !window->lane_windows.empty()) {
                 std::shared_ptr<CommState> comm_state;
-                ncclComm_t comm = nullptr;
+                std::vector<ncclComm_t> lane_comms;
                 {
                     std::lock_guard<std::mutex> comm_lock(comm_mutex_);
                     auto comm_it = comms_.find(window->session_key);
@@ -266,9 +299,9 @@ Status NcclTransport::uninstall() {
                 if (comm_state) {
                     std::lock_guard<std::mutex> comm_state_lock(
                         comm_state->mu);
-                    if (comm_state->ready) comm = comm_state->comm;
+                    if (comm_state->ready) lane_comms = comm_state->lane_comms;
                 }
-                if (!comm) {
+                if (lane_comms.empty()) {
                     LOG(WARNING) << "Skipping NCCL window deregister without "
                                     "ready communicator for session "
                                  << window->session_key;
@@ -278,11 +311,16 @@ Status NcclTransport::uninstall() {
                 auto status = setCudaDevice(window->device_index,
                                             previous_device);
                 if (status.ok()) {
-                    auto result = ncclCommWindowDeregister(comm,
-                                                           window->window);
-                    if (result != ncclSuccess)
-                        LOG(WARNING) << "ncclCommWindowDeregister failed: "
-                                     << ncclGetErrorString(result);
+                    for (size_t lane = 0;
+                         lane < window->lane_windows.size() &&
+                         lane < lane_comms.size();
+                         ++lane) {
+                        auto result = ncclCommWindowDeregister(
+                            lane_comms[lane], window->lane_windows[lane]);
+                        if (result != ncclSuccess)
+                            LOG(WARNING) << "ncclCommWindowDeregister failed: "
+                                         << ncclGetErrorString(result);
+                    }
                     cudaSetDevice(previous_device);
                 }
             }
@@ -299,11 +337,29 @@ Status NcclTransport::uninstall() {
     {
         std::lock_guard<std::mutex> lock(comm_mutex_);
         for (auto& [_, comm] : comms_) {
-            if (comm && comm->ready && comm->comm) {
-                auto result = ncclCommDestroy(comm->comm);
-                if (result != ncclSuccess)
-                    LOG(WARNING) << "ncclCommDestroy failed: "
-                                 << ncclGetErrorString(result);
+            if (comm && comm->ready) {
+                int previous_device = 0;
+                auto status = setCudaDevice(comm->device_index,
+                                            previous_device);
+                for (size_t lane = 0; lane < comm->lane_comms.size(); ++lane) {
+                    if (status.ok() && lane < comm->lane_dev_comms.size()) {
+                        auto result = ncclDevCommDestroy(
+                            comm->lane_comms[lane], &comm->lane_dev_comms[lane]);
+                        if (result != ncclSuccess)
+                            LOG(WARNING) << "ncclDevCommDestroy failed: "
+                                         << ncclGetErrorString(result);
+                    }
+                    if (comm->lane_comms[lane]) {
+                        auto result = ncclCommDestroy(comm->lane_comms[lane]);
+                        if (result != ncclSuccess)
+                            LOG(WARNING) << "ncclCommDestroy failed: "
+                                         << ncclGetErrorString(result);
+                    }
+                }
+                for (auto stream : comm->lane_streams) {
+                    if (stream) cudaStreamDestroy(stream);
+                }
+                if (status.ok()) cudaSetDevice(previous_device);
             }
         }
         comms_.clear();
@@ -463,13 +519,22 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
     }
 
     if (should_init) {
-        ncclUniqueId unique_id;
-        auto status = ncclStatus(ncclGetUniqueId(&unique_id),
-                                 "ncclGetUniqueId");
+        const size_t lanes = params_.gin_lanes;
+        std::vector<ncclUniqueId> unique_ids(lanes);
+        Status status;
+        for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+            status = ncclStatus(ncclGetUniqueId(&unique_ids[lane]),
+                                "ncclGetUniqueId");
+        }
         if (status.ok()) {
             NcclBootstrapDesc request;
             request.session_key = ctx.session_key;
-            request.unique_id = serializeUniqueId(unique_id);
+            request.unique_id = serializeUniqueId(unique_ids[0]);
+            request.comm_count = static_cast<int>(lanes);
+            request.unique_ids.reserve(lanes);
+            for (const auto& id : unique_ids) {
+                request.unique_ids.push_back(serializeUniqueId(id));
+            }
             request.device_index = ctx.remote_device;
             NcclBootstrapDesc response;
             status = ControlClient::bootstrapNccl(ctx.remote_rpc_addr,
@@ -479,9 +544,38 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
             int previous_device = 0;
             status = setCudaDevice(ctx.local_device, previous_device);
             if (status.ok()) {
-                status = ncclStatus(
-                    ncclCommInitRank(&state->comm, 2, unique_id, 0),
-                    "ncclCommInitRank");
+                state->lanes = lanes;
+                state->lane_comms.assign(lanes, nullptr);
+                state->lane_dev_comms.resize(lanes);
+                state->lane_streams.assign(lanes, nullptr);
+                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                    status = ncclStatus(
+                        ncclCommInitRank(&state->lane_comms[lane], 2,
+                                         unique_ids[lane], 0),
+                        "ncclCommInitRank");
+                }
+                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                    ncclDevCommRequirements_t reqs =
+                        NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+                    reqs.ginForceEnable = true;
+                    reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+                    reqs.ginContextCount = 1;
+                    reqs.ginSignalCount = 2;
+                    status = ncclStatus(
+                        ncclDevCommCreate(state->lane_comms[lane], &reqs,
+                                          &state->lane_dev_comms[lane]),
+                        "ncclDevCommCreate");
+                }
+                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                    status = cudaStatus(
+                        cudaStreamCreateWithFlags(&state->lane_streams[lane],
+                                                  cudaStreamNonBlocking),
+                        "cudaStreamCreateWithFlags");
+                }
+                if (status.ok()) {
+                    state->comm = state->lane_comms[0];
+                    state->dev_comm = state->lane_dev_comms[0];
+                }
                 cudaSetDevice(previous_device);
             }
         }
@@ -525,7 +619,7 @@ Status NcclTransport::ensureWindow(
         request.addr = ctx.target_base;
         request.length = ctx.target_length;
         request.device_index = ctx.remote_device;
-        request.win_flags = NCCL_WIN_DEFAULT;
+        request.win_flags = NCCL_WIN_COLL_SYMMETRIC;
         request.allocate_local = false;
         NcclWindowDesc response;
         status = ControlClient::registerNcclWindow(ctx.remote_rpc_addr,
@@ -544,11 +638,18 @@ Status NcclTransport::ensureWindow(
             state->owns_local_buffer = status.ok();
         }
         if (status.ok()) {
-            status = ncclStatus(
-                ncclCommWindowRegister(comm_state->comm, state->local_buffer,
-                                       ctx.target_length, &state->window,
-                                       NCCL_WIN_DEFAULT),
-                "ncclCommWindowRegister");
+            state->lane_windows.assign(comm_state->lane_comms.size(), nullptr);
+            for (size_t lane = 0;
+                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
+                status = ncclStatus(
+                    ncclCommWindowRegister(comm_state->lane_comms[lane],
+                                           state->local_buffer,
+                                           ctx.target_length,
+                                           &state->lane_windows[lane],
+                                           NCCL_WIN_COLL_SYMMETRIC),
+                    "ncclCommWindowRegister");
+            }
+            if (status.ok()) state->window = state->lane_windows[0];
         }
         if (device_changed) cudaSetDevice(previous_device);
 
@@ -605,12 +706,18 @@ Status NcclTransport::ensureSourceWindow(
             device_changed = status.ok();
         }
         if (status.ok()) {
-            status = ncclStatus(
-                ncclCommWindowRegister(
-                    comm_state->comm, reinterpret_cast<void*>(ctx.source_base),
-                    ctx.source_length, &state->window,
-                    NCCL_WIN_COLL_SYMMETRIC),
-                "ncclCommWindowRegister(source)");
+            state->lane_windows.assign(comm_state->lane_comms.size(), nullptr);
+            for (size_t lane = 0;
+                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
+                status = ncclStatus(
+                    ncclCommWindowRegister(
+                        comm_state->lane_comms[lane],
+                        reinterpret_cast<void*>(ctx.source_base),
+                        ctx.source_length, &state->lane_windows[lane],
+                        NCCL_WIN_COLL_SYMMETRIC),
+                    "ncclCommWindowRegister(source)");
+            }
+            if (status.ok()) state->window = state->lane_windows[0];
         }
         if (device_changed) cudaSetDevice(previous_device);
 
@@ -628,11 +735,13 @@ Status NcclTransport::ensureSourceWindow(
     return state->status;
 }
 
-Status NcclTransport::postRemoteWaitSignal(const TransferContext& ctx) {
+Status NcclTransport::postRemoteWaitSignal(const TransferContext& ctx,
+                                           uint64_t signal_value) {
     NcclSignalDesc request;
     request.session_key = ctx.session_key;
     request.peer = 0;
-    request.op_count = 1;
+    request.op_count = static_cast<int>(signal_value);
+    request.signal_value = signal_value;
     request.signal_index = 0;
     request.context = 0;
     request.device_index = ctx.remote_device;
@@ -641,10 +750,48 @@ Status NcclTransport::postRemoteWaitSignal(const TransferContext& ctx) {
                                          response);
 }
 
+Status NcclTransport::postRemotePutSignal(const TransferContext& ctx,
+                                          uint64_t signal_value) {
+    NcclSignalDesc request;
+    request.session_key = ctx.session_key;
+    request.peer = 0;
+    request.op_count = static_cast<int>(signal_value);
+    request.signal_value = signal_value;
+    request.signal_index = 0;
+    request.context = 0;
+    request.device_index = ctx.remote_device;
+    request.put_signal = true;
+    request.window_key = ctx.source_window_key;
+    request.source_window_key = ctx.window_key;
+    request.source_addr = ctx.target_offset;
+    request.length = ctx.source_length;
+    request.peer_window_offset = 0;
+    NcclSignalDesc response;
+    return ControlClient::waitNcclSignal(ctx.remote_rpc_addr, request,
+                                         response);
+}
+
+Status NcclTransport::postLocalWaitSignal(
+    const TransferContext& ctx, const std::shared_ptr<CommState>& comm_state,
+    uint64_t signal_value) {
+    (void)ctx;
+    for (size_t lane = 0; lane < comm_state->lane_comms.size(); ++lane) {
+        auto err = tentNcclGinLaunchWaitAck(
+            comm_state->lane_dev_comms[lane], comm_state->peer_rank,
+            static_cast<unsigned long long>(signal_value),
+            comm_state->lane_streams[lane]);
+        auto status = cudaStatus(err, "tentNcclGinLaunchWaitAck(local)");
+        if (!status.ok()) return status;
+    }
+    return Status::OK();
+}
+
 Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
                                       NcclBootstrapDesc& response) {
     response.session_key = request.session_key;
     response.unique_id = request.unique_id;
+    response.unique_ids = request.unique_ids;
+    response.comm_count = request.comm_count;
     response.device_index = request.device_index;
 
     bool should_init = false;
@@ -667,8 +814,16 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
 
     startBackground([state, request]() {
         Status status;
-        ncclUniqueId unique_id;
-        status = deserializeUniqueId(request.unique_id, unique_id);
+        const size_t lanes = request.comm_count > 0
+                                 ? static_cast<size_t>(request.comm_count)
+                                 : size_t{1};
+        std::vector<ncclUniqueId> unique_ids(lanes);
+        for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+            const std::string& raw =
+                request.unique_ids.empty() ? request.unique_id
+                                           : request.unique_ids[lane];
+            status = deserializeUniqueId(raw, unique_ids[lane]);
+        }
         int previous_device = 0;
         bool device_changed = false;
         if (status.ok()) {
@@ -676,8 +831,38 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
             device_changed = status.ok();
         }
         if (status.ok()) {
-            status = ncclStatus(ncclCommInitRank(&state->comm, 2, unique_id, 1),
-                                "ncclCommInitRank(remote)");
+            state->lanes = lanes;
+            state->lane_comms.assign(lanes, nullptr);
+            state->lane_dev_comms.resize(lanes);
+            state->lane_streams.assign(lanes, nullptr);
+            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                status = ncclStatus(
+                    ncclCommInitRank(&state->lane_comms[lane], 2,
+                                     unique_ids[lane], 1),
+                    "ncclCommInitRank(remote)");
+            }
+            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                ncclDevCommRequirements_t reqs =
+                    NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+                reqs.ginForceEnable = true;
+                reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+                reqs.ginContextCount = 1;
+                reqs.ginSignalCount = 2;
+                status = ncclStatus(
+                    ncclDevCommCreate(state->lane_comms[lane], &reqs,
+                                      &state->lane_dev_comms[lane]),
+                    "ncclDevCommCreate(remote)");
+            }
+            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                status = cudaStatus(
+                    cudaStreamCreateWithFlags(&state->lane_streams[lane],
+                                              cudaStreamNonBlocking),
+                    "cudaStreamCreateWithFlags(remote)");
+            }
+            if (status.ok()) {
+                state->comm = state->lane_comms[0];
+                state->dev_comm = state->lane_dev_comms[0];
+            }
         }
         if (device_changed) cudaSetDevice(previous_device);
         {
@@ -738,11 +923,17 @@ Status NcclTransport::onRegisterNcclWindow(const NcclWindowDesc& request,
             void* buffer = request.allocate_local
                                ? state->local_buffer
                                : reinterpret_cast<void*>(request.addr);
-            status = ncclStatus(
-                ncclCommWindowRegister(comm_state->comm, buffer,
-                                       request.length, &state->window,
-                                       request.win_flags),
-                "ncclCommWindowRegister(remote)");
+            state->lane_windows.assign(comm_state->lane_comms.size(), nullptr);
+            for (size_t lane = 0;
+                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
+                status = ncclStatus(
+                    ncclCommWindowRegister(comm_state->lane_comms[lane],
+                                           buffer, request.length,
+                                           &state->lane_windows[lane],
+                                           request.win_flags),
+                    "ncclCommWindowRegister(remote)");
+            }
+            if (status.ok()) state->window = state->lane_windows[0];
         }
         if (device_changed) cudaSetDevice(previous_device);
         {
@@ -768,22 +959,74 @@ Status NcclTransport::onWaitNcclSignal(const NcclSignalDesc& request,
     startBackground([this, request]() {
         std::shared_ptr<CommState> comm_state;
         Status status = waitForComm(request.session_key, comm_state);
+        std::shared_ptr<WindowState> window_state;
+        std::shared_ptr<WindowState> source_window_state;
+        if (status.ok() && request.put_signal) {
+            {
+                std::lock_guard<std::mutex> lock(window_mutex_);
+                auto dst_it = windows_.find(request.window_key);
+                auto src_it = windows_.find(request.source_window_key);
+                if (dst_it == windows_.end() || src_it == windows_.end()) {
+                    status = Status::InvalidArgument(
+                        "NCCL device put window not found" LOC_MARK);
+                } else {
+                    window_state = dst_it->second;
+                    source_window_state = src_it->second;
+                }
+            }
+            if (status.ok()) {
+                std::unique_lock<std::mutex> lock(window_state->mu);
+                window_state->cv.wait(lock, [&] {
+                    return window_state->ready || !window_state->status.ok();
+                });
+                status = window_state->status;
+            }
+            if (status.ok()) {
+                std::unique_lock<std::mutex> lock(source_window_state->mu);
+                source_window_state->cv.wait(lock, [&] {
+                    return source_window_state->ready ||
+                           !source_window_state->status.ok();
+                });
+                status = source_window_state->status;
+            }
+        }
         int previous_device = 0;
         bool device_changed = false;
         if (status.ok()) {
             status = setCudaDevice(request.device_index, previous_device);
             device_changed = status.ok();
         }
-        if (status.ok()) {
-            ncclWaitSignalDesc_t desc{request.op_count, request.peer,
-                                      request.signal_index, request.context};
-            status = ncclStatus(ncclWaitSignal(1, &desc, comm_state->comm,
-                                               nullptr),
-                                "ncclWaitSignal(remote)");
+        const uint64_t signal_value =
+            request.signal_value ? request.signal_value : request.op_count;
+        if (status.ok() && request.put_signal) {
+            const size_t lanes = comm_state->lane_comms.size();
+            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                const size_t begin = stripeOffset(request.length, lane, lanes);
+                const size_t end = stripeOffset(request.length, lane + 1, lanes);
+                const size_t bytes = end - begin;
+                auto err = tentNcclGinLaunchPut(
+                    comm_state->lane_dev_comms[lane], request.peer,
+                    window_state->lane_windows[lane],
+                    request.peer_window_offset + begin,
+                    source_window_state->lane_windows[lane],
+                    request.source_addr + begin, bytes,
+                    static_cast<unsigned long long>(signal_value),
+                    comm_state->lane_streams[lane]);
+                status = cudaStatus(err, "tentNcclGinLaunchPut(remote)");
+            }
+        } else if (status.ok()) {
+            for (size_t lane = 0;
+                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
+                auto err = tentNcclGinLaunchWaitAck(
+                    comm_state->lane_dev_comms[lane], request.peer,
+                    static_cast<unsigned long long>(signal_value),
+                    comm_state->lane_streams[lane]);
+                status = cudaStatus(err, "tentNcclGinLaunchWaitAck(remote)");
+            }
         }
         if (device_changed) cudaSetDevice(previous_device);
         if (!status.ok()) {
-            LOG(WARNING) << "NCCL remote wait-signal failed: "
+            LOG(WARNING) << "NCCL remote signal operation failed: "
                          << status.ToString();
         }
     });
@@ -807,19 +1050,70 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
     if (status.ok()) {
         status = ensureSourceWindow(ctx, comm_state, source_window_state);
     }
-    if (status.ok()) status = postRemoteWaitSignal(ctx);
+    const bool is_read = task->request.opcode == Request::READ;
+    const uint64_t signal_value = status.ok()
+                                      ? comm_state->signal_epoch.fetch_add(
+                                            1, std::memory_order_acq_rel) +
+                                            1
+                                      : 0;
+    if (status.ok() && !is_read) {
+        status = postRemoteWaitSignal(ctx, signal_value);
+    }
     if (status.ok()) {
         int previous_device = 0;
         status = setCudaDevice(ctx.local_device, previous_device);
         bool device_changed = status.ok();
         cudaEvent_t event = nullptr;
+        auto join_lane_streams = [&]() -> Status {
+            for (size_t lane = 0; lane < comm_state->lane_streams.size();
+                 ++lane) {
+                cudaEvent_t lane_event = nullptr;
+                auto err = cudaEventCreateWithFlags(&lane_event,
+                                                    cudaEventDisableTiming);
+                if (err != cudaSuccess) {
+                    return Status::InternalError(
+                        std::string("cudaEventCreateWithFlags(lane): ") +
+                        cudaGetErrorString(err) + LOC_MARK);
+                }
+                err = cudaEventRecord(lane_event,
+                                      comm_state->lane_streams[lane]);
+                if (err == cudaSuccess) {
+                    err = cudaStreamWaitEvent(batch->stream.get(), lane_event,
+                                              0);
+                }
+                cudaEventDestroy(lane_event);
+                if (err != cudaSuccess) {
+                    return Status::InternalError(
+                        std::string("cudaStreamWaitEvent(lane): ") +
+                        cudaGetErrorString(err) + LOC_MARK);
+                }
+            }
+            return Status::OK();
+        };
         if (status.ok()) {
-            status = ncclStatus(
-                ncclPutSignal(task->request.source, task->request.length,
-                              ncclUint8, comm_state->peer_rank,
-                              window_state->window, ctx.target_offset, 0, 0,
-                              0, comm_state->comm, batch->stream.get()),
-                "ncclPutSignal");
+            if (is_read) {
+                status = postLocalWaitSignal(ctx, comm_state, signal_value);
+                if (status.ok()) status = postRemotePutSignal(ctx, signal_value);
+            } else {
+                const size_t lanes = comm_state->lane_comms.size();
+                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                    const size_t begin = stripeOffset(task->request.length,
+                                                      lane, lanes);
+                    const size_t end = stripeOffset(task->request.length,
+                                                    lane + 1, lanes);
+                    const size_t bytes = end - begin;
+                    auto err = tentNcclGinLaunchPut(
+                        comm_state->lane_dev_comms[lane],
+                        comm_state->peer_rank,
+                        window_state->lane_windows[lane],
+                        ctx.target_offset + begin,
+                        source_window_state->lane_windows[lane], begin, bytes,
+                        static_cast<unsigned long long>(signal_value),
+                        comm_state->lane_streams[lane]);
+                    status = cudaStatus(err, "tentNcclGinLaunchPut");
+                }
+            }
+            if (status.ok()) status = join_lane_streams();
             if (status.ok()) {
                 auto err = cudaEventCreateWithFlags(&event,
                                                     cudaEventDisableTiming);
@@ -871,11 +1165,6 @@ Status NcclTransport::submitTransferTasks(
         task.transferred_bytes.store(0, std::memory_order_release);
         task.completion_event.store(nullptr, std::memory_order_release);
 
-        if (request.opcode == Request::READ) {
-            CHECK_STATUS(markFailed(
-                task, "READ needs device-side ncclGinGet or delegated put"));
-            continue;
-        }
         new_tasks.push_back(&task);
     }
 

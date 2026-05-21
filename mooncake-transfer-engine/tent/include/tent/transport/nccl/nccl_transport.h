@@ -29,6 +29,7 @@
 
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include <nccl_device.h>
 
 #include "tent/common/concurrent/thread_pool.h"
 #include "tent/platform/cuda.h"
@@ -40,6 +41,7 @@ namespace tent {
 
 struct NcclParams {
     size_t max_concurrent_tasks = 4;
+    size_t gin_lanes = 4;
 };
 
 struct NcclTask {
@@ -119,7 +121,13 @@ class NcclTransport : public Transport {
     Status ensureSourceWindow(const TransferContext& ctx,
                               const std::shared_ptr<CommState>& comm_state,
                               std::shared_ptr<WindowState>& state);
-    Status postRemoteWaitSignal(const TransferContext& ctx);
+    Status postRemoteWaitSignal(const TransferContext& ctx,
+                                uint64_t signal_value);
+    Status postRemotePutSignal(const TransferContext& ctx,
+                               uint64_t signal_value);
+    Status postLocalWaitSignal(const TransferContext& ctx,
+                               const std::shared_ptr<CommState>& comm_state,
+                               uint64_t signal_value);
     Status waitForComm(const std::string& session_key,
                        std::shared_ptr<CommState>& state);
     Status onBootstrapNccl(const NcclBootstrapDesc& request,
