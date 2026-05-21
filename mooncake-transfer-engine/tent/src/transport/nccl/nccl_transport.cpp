@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -32,13 +33,14 @@
 #include "tent/runtime/topology.h"
 
 extern "C" cudaError_t tentNcclGinLaunchPut(
-    ncclDevComm_t dev_comm, int peer, ncclWindow_t dst_window,
-    size_t dst_offset, ncclWindow_t src_window, size_t src_offset,
-    size_t bytes, unsigned long long signal_value, cudaStream_t stream);
+    ncclDevComm_t dev_comm, int peer, int context_index,
+    ncclWindow_t dst_window, size_t dst_offset, ncclWindow_t src_window,
+    size_t src_offset, size_t bytes, unsigned long long signal_value,
+    cudaStream_t stream);
 
 extern "C" cudaError_t tentNcclGinLaunchWaitAck(
-    ncclDevComm_t dev_comm, int peer, unsigned long long signal_value,
-    cudaStream_t stream);
+    ncclDevComm_t dev_comm, int peer, int context_index,
+    unsigned long long signal_value, cudaStream_t stream);
 
 namespace mooncake {
 namespace tent {
@@ -134,8 +136,6 @@ struct NcclTransport::CommState {
     std::condition_variable cv;
     ncclComm_t comm = nullptr;
     ncclDevComm_t dev_comm{};
-    std::vector<ncclComm_t> lane_comms;
-    std::vector<ncclDevComm_t> lane_dev_comms;
     std::vector<cudaStream_t> lane_streams;
     std::atomic<uint64_t> signal_epoch{0};
     size_t lanes = 1;
@@ -151,7 +151,6 @@ struct NcclTransport::WindowState {
     std::mutex mu;
     std::condition_variable cv;
     ncclWindow_t window = nullptr;
-    std::vector<ncclWindow_t> lane_windows;
     void* local_buffer = nullptr;
     uint64_t length = 0;
     bool owns_local_buffer = false;
@@ -226,6 +225,16 @@ Status NcclTransport::install(std::string& local_segment_name,
     if (params_.max_concurrent_tasks == 0) params_.max_concurrent_tasks = 1;
     if (params_.gin_lanes == 0) params_.gin_lanes = 1;
     if (params_.gin_lanes > 16) params_.gin_lanes = 16;
+    if (params_.gin_lanes > 1 && !std::getenv("NCCL_GIN_NCONNECTIONS")) {
+        const std::string connections = std::to_string(params_.gin_lanes);
+        if (setenv("NCCL_GIN_NCONNECTIONS", connections.c_str(), 0) != 0) {
+            LOG(WARNING) << "Failed to set NCCL_GIN_NCONNECTIONS="
+                         << connections;
+        } else {
+            LOG(INFO) << "Defaulting NCCL_GIN_NCONNECTIONS=" << connections
+                      << " for NCCL GIN context striping";
+        }
+    }
     shutting_down_.store(false, std::memory_order_release);
     thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
 
@@ -288,9 +297,9 @@ Status NcclTransport::uninstall() {
         for (auto& [_, window] : windows_) {
             if (!window) continue;
             std::unique_lock<std::mutex> state_lock(window->mu);
-            if (window->ready && !window->lane_windows.empty()) {
+            if (window->ready && window->window) {
                 std::shared_ptr<CommState> comm_state;
-                std::vector<ncclComm_t> lane_comms;
+                ncclComm_t comm = nullptr;
                 {
                     std::lock_guard<std::mutex> comm_lock(comm_mutex_);
                     auto comm_it = comms_.find(window->session_key);
@@ -299,9 +308,9 @@ Status NcclTransport::uninstall() {
                 if (comm_state) {
                     std::lock_guard<std::mutex> comm_state_lock(
                         comm_state->mu);
-                    if (comm_state->ready) lane_comms = comm_state->lane_comms;
+                    if (comm_state->ready) comm = comm_state->comm;
                 }
-                if (lane_comms.empty()) {
+                if (!comm) {
                     LOG(WARNING) << "Skipping NCCL window deregister without "
                                     "ready communicator for session "
                                  << window->session_key;
@@ -311,16 +320,11 @@ Status NcclTransport::uninstall() {
                 auto status = setCudaDevice(window->device_index,
                                             previous_device);
                 if (status.ok()) {
-                    for (size_t lane = 0;
-                         lane < window->lane_windows.size() &&
-                         lane < lane_comms.size();
-                         ++lane) {
-                        auto result = ncclCommWindowDeregister(
-                            lane_comms[lane], window->lane_windows[lane]);
-                        if (result != ncclSuccess)
-                            LOG(WARNING) << "ncclCommWindowDeregister failed: "
-                                         << ncclGetErrorString(result);
-                    }
+                    auto result =
+                        ncclCommWindowDeregister(comm, window->window);
+                    if (result != ncclSuccess)
+                        LOG(WARNING) << "ncclCommWindowDeregister failed: "
+                                     << ncclGetErrorString(result);
                     cudaSetDevice(previous_device);
                 }
             }
@@ -341,20 +345,16 @@ Status NcclTransport::uninstall() {
                 int previous_device = 0;
                 auto status = setCudaDevice(comm->device_index,
                                             previous_device);
-                for (size_t lane = 0; lane < comm->lane_comms.size(); ++lane) {
-                    if (status.ok() && lane < comm->lane_dev_comms.size()) {
-                        auto result = ncclDevCommDestroy(
-                            comm->lane_comms[lane], &comm->lane_dev_comms[lane]);
-                        if (result != ncclSuccess)
-                            LOG(WARNING) << "ncclDevCommDestroy failed: "
-                                         << ncclGetErrorString(result);
-                    }
-                    if (comm->lane_comms[lane]) {
-                        auto result = ncclCommDestroy(comm->lane_comms[lane]);
-                        if (result != ncclSuccess)
-                            LOG(WARNING) << "ncclCommDestroy failed: "
-                                         << ncclGetErrorString(result);
-                    }
+                if (status.ok() && comm->comm) {
+                    auto result =
+                        ncclDevCommDestroy(comm->comm, &comm->dev_comm);
+                    if (result != ncclSuccess)
+                        LOG(WARNING) << "ncclDevCommDestroy failed: "
+                                     << ncclGetErrorString(result);
+                    result = ncclCommDestroy(comm->comm);
+                    if (result != ncclSuccess)
+                        LOG(WARNING) << "ncclCommDestroy failed: "
+                                     << ncclGetErrorString(result);
                 }
                 for (auto stream : comm->lane_streams) {
                     if (stream) cudaStreamDestroy(stream);
@@ -520,21 +520,16 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
 
     if (should_init) {
         const size_t lanes = params_.gin_lanes;
-        std::vector<ncclUniqueId> unique_ids(lanes);
-        Status status;
-        for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-            status = ncclStatus(ncclGetUniqueId(&unique_ids[lane]),
-                                "ncclGetUniqueId");
-        }
+        ncclUniqueId unique_id{};
+        Status status = ncclStatus(ncclGetUniqueId(&unique_id),
+                                   "ncclGetUniqueId");
         if (status.ok()) {
             NcclBootstrapDesc request;
             request.session_key = ctx.session_key;
-            request.unique_id = serializeUniqueId(unique_ids[0]);
+            request.unique_id = serializeUniqueId(unique_id);
+            // For the single-communicator device-GIN path this field carries
+            // the requested number of GIN contexts/stripe lanes.
             request.comm_count = static_cast<int>(lanes);
-            request.unique_ids.reserve(lanes);
-            for (const auto& id : unique_ids) {
-                request.unique_ids.push_back(serializeUniqueId(id));
-            }
             request.device_index = ctx.remote_device;
             NcclBootstrapDesc response;
             status = ControlClient::bootstrapNccl(ctx.remote_rpc_addr,
@@ -545,36 +540,50 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
             status = setCudaDevice(ctx.local_device, previous_device);
             if (status.ok()) {
                 state->lanes = lanes;
-                state->lane_comms.assign(lanes, nullptr);
-                state->lane_dev_comms.resize(lanes);
-                state->lane_streams.assign(lanes, nullptr);
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                    status = ncclStatus(
-                        ncclCommInitRank(&state->lane_comms[lane], 2,
-                                         unique_ids[lane], 0),
-                        "ncclCommInitRank");
-                }
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                status = ncclStatus(
+                    ncclCommInitRank(&state->comm, 2, unique_id, 0),
+                    "ncclCommInitRank");
+                if (status.ok()) {
                     ncclDevCommRequirements_t reqs =
                         NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
                     reqs.ginForceEnable = true;
                     reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-                    reqs.ginContextCount = 1;
+                    reqs.ginContextCount = static_cast<int>(lanes);
                     reqs.ginSignalCount = 2;
                     status = ncclStatus(
-                        ncclDevCommCreate(state->lane_comms[lane], &reqs,
-                                          &state->lane_dev_comms[lane]),
+                        ncclDevCommCreate(state->comm, &reqs,
+                                          &state->dev_comm),
                         "ncclDevCommCreate");
                 }
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                    status = cudaStatus(
-                        cudaStreamCreateWithFlags(&state->lane_streams[lane],
-                                                  cudaStreamNonBlocking),
-                        "cudaStreamCreateWithFlags");
+                if (status.ok() &&
+                    static_cast<size_t>(state->dev_comm.ginContextCount) <
+                        lanes) {
+                    status = Status::InternalError(
+                        "NCCL dev comm did not provide requested GIN contexts" LOC_MARK);
                 }
                 if (status.ok()) {
-                    state->comm = state->lane_comms[0];
-                    state->dev_comm = state->lane_dev_comms[0];
+                    state->lane_streams.assign(lanes, nullptr);
+                    for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                        status = cudaStatus(
+                            cudaStreamCreateWithFlags(&state->lane_streams[lane],
+                                                      cudaStreamNonBlocking),
+                            "cudaStreamCreateWithFlags");
+                    }
+                }
+                if (status.ok()) {
+                    LOG(INFO) << "NCCL GIN single communicator ready: lanes="
+                              << lanes << " gin_connections="
+                              << static_cast<int>(
+                                     state->dev_comm.ginConnectionCount)
+                              << " gin_contexts="
+                              << state->dev_comm.ginContextCount;
+                    if (static_cast<size_t>(
+                            state->dev_comm.ginConnectionCount) < lanes) {
+                        LOG(WARNING)
+                            << "NCCL GIN has fewer connections than contexts; "
+                               "set NCCL_GIN_NCONNECTIONS="
+                            << lanes << " for peak striped bandwidth";
+                    }
                 }
                 cudaSetDevice(previous_device);
             }
@@ -638,18 +647,11 @@ Status NcclTransport::ensureWindow(
             state->owns_local_buffer = status.ok();
         }
         if (status.ok()) {
-            state->lane_windows.assign(comm_state->lane_comms.size(), nullptr);
-            for (size_t lane = 0;
-                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
-                status = ncclStatus(
-                    ncclCommWindowRegister(comm_state->lane_comms[lane],
-                                           state->local_buffer,
-                                           ctx.target_length,
-                                           &state->lane_windows[lane],
-                                           NCCL_WIN_COLL_SYMMETRIC),
-                    "ncclCommWindowRegister");
-            }
-            if (status.ok()) state->window = state->lane_windows[0];
+            status = ncclStatus(
+                ncclCommWindowRegister(comm_state->comm, state->local_buffer,
+                                       ctx.target_length, &state->window,
+                                       NCCL_WIN_COLL_SYMMETRIC),
+                "ncclCommWindowRegister");
         }
         if (device_changed) cudaSetDevice(previous_device);
 
@@ -706,18 +708,12 @@ Status NcclTransport::ensureSourceWindow(
             device_changed = status.ok();
         }
         if (status.ok()) {
-            state->lane_windows.assign(comm_state->lane_comms.size(), nullptr);
-            for (size_t lane = 0;
-                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
-                status = ncclStatus(
-                    ncclCommWindowRegister(
-                        comm_state->lane_comms[lane],
-                        reinterpret_cast<void*>(ctx.source_base),
-                        ctx.source_length, &state->lane_windows[lane],
-                        NCCL_WIN_COLL_SYMMETRIC),
-                    "ncclCommWindowRegister(source)");
-            }
-            if (status.ok()) state->window = state->lane_windows[0];
+            status = ncclStatus(
+                ncclCommWindowRegister(
+                    comm_state->comm, reinterpret_cast<void*>(ctx.source_base),
+                    ctx.source_length, &state->window,
+                    NCCL_WIN_COLL_SYMMETRIC),
+                "ncclCommWindowRegister(source)");
         }
         if (device_changed) cudaSetDevice(previous_device);
 
@@ -775,9 +771,10 @@ Status NcclTransport::postLocalWaitSignal(
     const TransferContext& ctx, const std::shared_ptr<CommState>& comm_state,
     uint64_t signal_value) {
     (void)ctx;
-    for (size_t lane = 0; lane < comm_state->lane_comms.size(); ++lane) {
+    for (size_t lane = 0; lane < comm_state->lanes; ++lane) {
         auto err = tentNcclGinLaunchWaitAck(
-            comm_state->lane_dev_comms[lane], comm_state->peer_rank,
+            comm_state->dev_comm, comm_state->peer_rank,
+            static_cast<int>(lane),
             static_cast<unsigned long long>(signal_value),
             comm_state->lane_streams[lane]);
         auto status = cudaStatus(err, "tentNcclGinLaunchWaitAck(local)");
@@ -817,13 +814,11 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
         const size_t lanes = request.comm_count > 0
                                  ? static_cast<size_t>(request.comm_count)
                                  : size_t{1};
-        std::vector<ncclUniqueId> unique_ids(lanes);
-        for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-            const std::string& raw =
-                request.unique_ids.empty() ? request.unique_id
-                                           : request.unique_ids[lane];
-            status = deserializeUniqueId(raw, unique_ids[lane]);
-        }
+        ncclUniqueId unique_id{};
+        const std::string& raw = request.unique_ids.empty()
+                                     ? request.unique_id
+                                     : request.unique_ids[0];
+        status = deserializeUniqueId(raw, unique_id);
         int previous_device = 0;
         bool device_changed = false;
         if (status.ok()) {
@@ -832,36 +827,48 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
         }
         if (status.ok()) {
             state->lanes = lanes;
-            state->lane_comms.assign(lanes, nullptr);
-            state->lane_dev_comms.resize(lanes);
-            state->lane_streams.assign(lanes, nullptr);
-            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                status = ncclStatus(
-                    ncclCommInitRank(&state->lane_comms[lane], 2,
-                                     unique_ids[lane], 1),
-                    "ncclCommInitRank(remote)");
-            }
-            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+            status = ncclStatus(
+                ncclCommInitRank(&state->comm, 2, unique_id, 1),
+                "ncclCommInitRank(remote)");
+            if (status.ok()) {
                 ncclDevCommRequirements_t reqs =
                     NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
                 reqs.ginForceEnable = true;
                 reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-                reqs.ginContextCount = 1;
+                reqs.ginContextCount = static_cast<int>(lanes);
                 reqs.ginSignalCount = 2;
                 status = ncclStatus(
-                    ncclDevCommCreate(state->lane_comms[lane], &reqs,
-                                      &state->lane_dev_comms[lane]),
+                    ncclDevCommCreate(state->comm, &reqs,
+                                      &state->dev_comm),
                     "ncclDevCommCreate(remote)");
             }
-            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                status = cudaStatus(
-                    cudaStreamCreateWithFlags(&state->lane_streams[lane],
-                                              cudaStreamNonBlocking),
-                    "cudaStreamCreateWithFlags(remote)");
+            if (status.ok() &&
+                static_cast<size_t>(state->dev_comm.ginContextCount) < lanes) {
+                status = Status::InternalError(
+                    "NCCL remote dev comm did not provide requested GIN contexts" LOC_MARK);
             }
             if (status.ok()) {
-                state->comm = state->lane_comms[0];
-                state->dev_comm = state->lane_dev_comms[0];
+                state->lane_streams.assign(lanes, nullptr);
+                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
+                    status = cudaStatus(
+                        cudaStreamCreateWithFlags(&state->lane_streams[lane],
+                                                  cudaStreamNonBlocking),
+                        "cudaStreamCreateWithFlags(remote)");
+                }
+            }
+            if (status.ok()) {
+                LOG(INFO) << "NCCL GIN remote single communicator ready: lanes="
+                          << lanes << " gin_connections="
+                          << static_cast<int>(state->dev_comm.ginConnectionCount)
+                          << " gin_contexts="
+                          << state->dev_comm.ginContextCount;
+                if (static_cast<size_t>(state->dev_comm.ginConnectionCount) <
+                    lanes) {
+                    LOG(WARNING)
+                        << "NCCL GIN has fewer connections than contexts; "
+                           "set NCCL_GIN_NCONNECTIONS="
+                        << lanes << " for peak striped bandwidth";
+                }
             }
         }
         if (device_changed) cudaSetDevice(previous_device);
@@ -923,17 +930,11 @@ Status NcclTransport::onRegisterNcclWindow(const NcclWindowDesc& request,
             void* buffer = request.allocate_local
                                ? state->local_buffer
                                : reinterpret_cast<void*>(request.addr);
-            state->lane_windows.assign(comm_state->lane_comms.size(), nullptr);
-            for (size_t lane = 0;
-                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
-                status = ncclStatus(
-                    ncclCommWindowRegister(comm_state->lane_comms[lane],
-                                           buffer, request.length,
-                                           &state->lane_windows[lane],
-                                           request.win_flags),
-                    "ncclCommWindowRegister(remote)");
-            }
-            if (status.ok()) state->window = state->lane_windows[0];
+            status = ncclStatus(
+                ncclCommWindowRegister(comm_state->comm, buffer,
+                                       request.length, &state->window,
+                                       request.win_flags),
+                "ncclCommWindowRegister(remote)");
         }
         if (device_changed) cudaSetDevice(previous_device);
         {
@@ -999,26 +1000,26 @@ Status NcclTransport::onWaitNcclSignal(const NcclSignalDesc& request,
         const uint64_t signal_value =
             request.signal_value ? request.signal_value : request.op_count;
         if (status.ok() && request.put_signal) {
-            const size_t lanes = comm_state->lane_comms.size();
+            const size_t lanes = comm_state->lanes;
             for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
                 const size_t begin = stripeOffset(request.length, lane, lanes);
                 const size_t end = stripeOffset(request.length, lane + 1, lanes);
                 const size_t bytes = end - begin;
                 auto err = tentNcclGinLaunchPut(
-                    comm_state->lane_dev_comms[lane], request.peer,
-                    window_state->lane_windows[lane],
+                    comm_state->dev_comm, request.peer,
+                    static_cast<int>(lane), window_state->window,
                     request.peer_window_offset + begin,
-                    source_window_state->lane_windows[lane],
-                    request.source_addr + begin, bytes,
-                    static_cast<unsigned long long>(signal_value),
+                    source_window_state->window, request.source_addr + begin,
+                    bytes, static_cast<unsigned long long>(signal_value),
                     comm_state->lane_streams[lane]);
                 status = cudaStatus(err, "tentNcclGinLaunchPut(remote)");
             }
         } else if (status.ok()) {
-            for (size_t lane = 0;
-                 lane < comm_state->lane_comms.size() && status.ok(); ++lane) {
+            for (size_t lane = 0; lane < comm_state->lanes && status.ok();
+                 ++lane) {
                 auto err = tentNcclGinLaunchWaitAck(
-                    comm_state->lane_dev_comms[lane], request.peer,
+                    comm_state->dev_comm, request.peer,
+                    static_cast<int>(lane),
                     static_cast<unsigned long long>(signal_value),
                     comm_state->lane_streams[lane]);
                 status = cudaStatus(err, "tentNcclGinLaunchWaitAck(remote)");
@@ -1095,7 +1096,7 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
                 status = postLocalWaitSignal(ctx, comm_state, signal_value);
                 if (status.ok()) status = postRemotePutSignal(ctx, signal_value);
             } else {
-                const size_t lanes = comm_state->lane_comms.size();
+                const size_t lanes = comm_state->lanes;
                 for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
                     const size_t begin = stripeOffset(task->request.length,
                                                       lane, lanes);
@@ -1103,11 +1104,10 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
                                                     lane + 1, lanes);
                     const size_t bytes = end - begin;
                     auto err = tentNcclGinLaunchPut(
-                        comm_state->lane_dev_comms[lane],
-                        comm_state->peer_rank,
-                        window_state->lane_windows[lane],
-                        ctx.target_offset + begin,
-                        source_window_state->lane_windows[lane], begin, bytes,
+                        comm_state->dev_comm, comm_state->peer_rank,
+                        static_cast<int>(lane), window_state->window,
+                        ctx.target_offset + begin, source_window_state->window,
+                        begin, bytes,
                         static_cast<unsigned long long>(signal_value),
                         comm_state->lane_streams[lane]);
                     status = cudaStatus(err, "tentNcclGinLaunchPut");
