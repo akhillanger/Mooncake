@@ -19,6 +19,7 @@
 namespace {
 
 __global__ void ncclGinPutKernel(ncclDevComm comm, int peer,
+                                 int context_index,
                                  ncclWindow_t dst_window,
                                  size_t dst_offset,
                                  ncclWindow_t src_window,
@@ -27,7 +28,7 @@ __global__ void ncclGinPutKernel(ncclDevComm comm, int peer,
                                  unsigned long long ack_signal_value) {
 #if __CUDA_ARCH__ >= 700
     ncclTeam world = ncclTeamWorld(comm);
-    ncclGin gin(comm, 0);
+    ncclGin gin(comm, context_index);
     const ncclCoopCta coop = ncclCoopCta();
     gin.put(world, peer, dst_window, dst_offset, src_window, src_offset, bytes,
             ncclGin_StrongSignalInc{0}, ncclGin_None{}, coop);
@@ -36,11 +37,12 @@ __global__ void ncclGinPutKernel(ncclDevComm comm, int peer,
 }
 
 __global__ void ncclGinWaitAckKernel(ncclDevComm comm, int peer,
+                                     int context_index,
                                      unsigned long long data_signal_value,
                                      unsigned long long ack_signal_value) {
 #if __CUDA_ARCH__ >= 700
     ncclTeam world = ncclTeamWorld(comm);
-    ncclGin gin(comm, 0);
+    ncclGin gin(comm, context_index);
     const ncclCoopCta coop = ncclCoopCta();
     gin.waitSignal(coop, 0, data_signal_value);
     gin.signal(world, peer, ncclGin_StrongSignalInc{1}, coop);
@@ -50,6 +52,7 @@ __global__ void ncclGinWaitAckKernel(ncclDevComm comm, int peer,
 }  // namespace
 
 extern "C" cudaError_t tentNcclGinLaunchPut(ncclDevComm_t dev_comm, int peer,
+                                             int context_index,
                                              ncclWindow_t dst_window,
                                              size_t dst_offset,
                                              ncclWindow_t src_window,
@@ -57,16 +60,17 @@ extern "C" cudaError_t tentNcclGinLaunchPut(ncclDevComm_t dev_comm, int peer,
                                              unsigned long long signal_value,
                                              cudaStream_t stream) {
     ncclGinPutKernel<<<1, 128, 0, stream>>>(
-        dev_comm, peer, dst_window, dst_offset, src_window, src_offset, bytes,
-        signal_value, signal_value);
+        dev_comm, peer, context_index, dst_window, dst_offset, src_window,
+        src_offset, bytes, signal_value, signal_value);
     return cudaGetLastError();
 }
 
 extern "C" cudaError_t tentNcclGinLaunchWaitAck(ncclDevComm_t dev_comm,
                                                  int peer,
+                                                 int context_index,
                                                  unsigned long long signal_value,
                                                  cudaStream_t stream) {
-    ncclGinWaitAckKernel<<<1, 128, 0, stream>>>(dev_comm, peer, signal_value,
-                                                signal_value);
+    ncclGinWaitAckKernel<<<1, 128, 0, stream>>>(
+        dev_comm, peer, context_index, signal_value, signal_value);
     return cudaGetLastError();
 }
