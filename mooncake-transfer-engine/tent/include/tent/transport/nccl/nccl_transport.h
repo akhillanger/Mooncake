@@ -123,11 +123,6 @@ class NcclTransport : public Transport {
                               std::shared_ptr<WindowState>& state);
     Status postRemoteWaitSignal(const TransferContext& ctx,
                                 uint64_t signal_value);
-    Status postRemotePutSignal(const TransferContext& ctx,
-                               uint64_t signal_value);
-    Status postLocalWaitSignal(const TransferContext& ctx,
-                               const std::shared_ptr<CommState>& comm_state,
-                               uint64_t signal_value);
     Status waitForComm(const std::string& session_key,
                        std::shared_ptr<CommState>& state);
     Status onBootstrapNccl(const NcclBootstrapDesc& request,
