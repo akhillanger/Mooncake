@@ -26,6 +26,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
@@ -62,12 +63,15 @@ struct XferDataDesc {
 struct NcclBootstrapDesc {
     std::string session_key;
     std::string unique_id;
+    std::vector<std::string> unique_ids;
+    int comm_count = 1;
     int device_index = 0;
     std::string reply_msg;
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclBootstrapDesc, session_key, unique_id,
-                                   device_index, reply_msg);
+                                   unique_ids, comm_count, device_index,
+                                   reply_msg);
 };
 
 struct NcclWindowDesc {
@@ -93,12 +97,20 @@ struct NcclSignalDesc {
     int signal_index = 0;
     int context = 0;
     int device_index = 0;
+    bool put_signal = false;
+    std::string window_key;
+    std::string source_window_key;
+    uint64_t source_addr = 0;
+    uint64_t length = 0;
+    uint64_t peer_window_offset = 0;
+    uint64_t signal_value = 0;
     std::string reply_msg;
 
    public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclSignalDesc, session_key, peer,
-                                   op_count, signal_index, context,
-                                   device_index, reply_msg);
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(
+        NcclSignalDesc, session_key, peer, op_count, signal_index, context,
+        device_index, put_signal, window_key, source_window_key, source_addr,
+        length, peer_window_offset, signal_value, reply_msg);
 };
 
 using OnReceiveBootstrap =

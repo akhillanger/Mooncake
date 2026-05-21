@@ -320,6 +320,10 @@ void ControlService::onBootstrapNccl(const std::string_view& request,
         json::parse(std::string(request)).get<NcclBootstrapDesc>();
     NcclBootstrapDesc response_desc;
     response_desc.session_key = request_desc.session_key;
+    response_desc.unique_id = request_desc.unique_id;
+    response_desc.unique_ids = request_desc.unique_ids;
+    response_desc.comm_count = request_desc.comm_count;
+    response_desc.device_index = request_desc.device_index;
     if (nccl_bootstrap_callback_) {
         nccl_bootstrap_callback_(request_desc, response_desc);
     } else {
@@ -361,6 +365,13 @@ void ControlService::onWaitNcclSignal(const std::string_view& request,
     response_desc.signal_index = request_desc.signal_index;
     response_desc.context = request_desc.context;
     response_desc.device_index = request_desc.device_index;
+    response_desc.put_signal = request_desc.put_signal;
+    response_desc.window_key = request_desc.window_key;
+    response_desc.source_window_key = request_desc.source_window_key;
+    response_desc.source_addr = request_desc.source_addr;
+    response_desc.length = request_desc.length;
+    response_desc.peer_window_offset = request_desc.peer_window_offset;
+    response_desc.signal_value = request_desc.signal_value;
     if (nccl_signal_callback_) {
         nccl_signal_callback_(request_desc, response_desc);
     } else {

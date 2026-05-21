@@ -835,7 +835,6 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
-            if (type == NCCL && request.opcode == Request::READ) continue;
             if (checkAvailability(transport_list_[type], local_mtype,
                                   remote_mtype)) {
                 if (priority-- == 0) return type;
