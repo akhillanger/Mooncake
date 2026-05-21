@@ -36,6 +36,22 @@ __global__ void ncclGinPutKernel(ncclDevComm comm, int peer,
 #endif
 }
 
+__global__ void ncclGinGetKernel(ncclDevComm comm, int peer,
+                                 int context_index,
+                                 ncclWindow_t remote_window,
+                                 size_t remote_offset,
+                                 ncclWindow_t local_window,
+                                 size_t local_offset, size_t bytes) {
+#if __CUDA_ARCH__ >= 700
+    ncclTeam world = ncclTeamWorld(comm);
+    ncclGin gin(comm, context_index);
+    const ncclCoopCta coop = ncclCoopCta();
+    gin.get(world, peer, remote_window, remote_offset, local_window,
+            local_offset, bytes, coop);
+    gin.flush(coop);
+#endif
+}
+
 __global__ void ncclGinWaitAckKernel(ncclDevComm comm, int peer,
                                      int context_index,
                                      unsigned long long data_signal_value,
@@ -62,6 +78,19 @@ extern "C" cudaError_t tentNcclGinLaunchPut(ncclDevComm_t dev_comm, int peer,
     ncclGinPutKernel<<<1, 128, 0, stream>>>(
         dev_comm, peer, context_index, dst_window, dst_offset, src_window,
         src_offset, bytes, signal_value, signal_value);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t tentNcclGinLaunchGet(ncclDevComm_t dev_comm, int peer,
+                                             int context_index,
+                                             ncclWindow_t remote_window,
+                                             size_t remote_offset,
+                                             ncclWindow_t local_window,
+                                             size_t local_offset, size_t bytes,
+                                             cudaStream_t stream) {
+    ncclGinGetKernel<<<1, 128, 0, stream>>>(
+        dev_comm, peer, context_index, remote_window, remote_offset,
+        local_window, local_offset, bytes);
     return cudaGetLastError();
 }
 
