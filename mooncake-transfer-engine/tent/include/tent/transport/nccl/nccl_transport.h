@@ -42,6 +42,7 @@ namespace tent {
 struct NcclParams {
     size_t max_concurrent_tasks = 4;
     size_t gin_lanes = 4;
+    bool wait_ack = false;
 };
 
 struct NcclTask {
