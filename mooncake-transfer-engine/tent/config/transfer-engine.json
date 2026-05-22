@@ -87,6 +87,12 @@
         },
         "mnnvl": {
             "enable" : false
+        },
+        "nccl": {
+            "enable": false,
+            "allow_external_window_buffers": false,
+            "max_concurrent_tasks": 4,
+            "wait_ack": false
         }
     }
 }

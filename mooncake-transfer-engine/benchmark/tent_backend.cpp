@@ -56,7 +56,8 @@ std::shared_ptr<Config> loadConfig() {
         std::unordered_map<std::string, std::string> transport_map = {
             {"rdma", "rdma"},        {"tcp", "tcp"},     {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},          {"mnnvl", "mnnvl"}, {"nvlink", "nvlink"}};
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}, {"nvlink", "nvlink"},
+            {"nccl", "nccl"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -81,6 +82,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
+    if (xport_type == "nccl") return NCCL;
     return UNSPEC;
 }
 

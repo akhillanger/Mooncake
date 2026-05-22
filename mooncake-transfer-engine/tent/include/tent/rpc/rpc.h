@@ -47,6 +47,9 @@ enum RpcFuncID {
     Unpin,
     SubscribeSegmentUpdate,
     NotifySegmentUpdated,
+    BootstrapNccl,
+    RegisterNcclWindow,
+    WaitNcclSignal,
 };
 
 class ClientPool;
