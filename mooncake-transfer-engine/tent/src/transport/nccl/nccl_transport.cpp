@@ -33,18 +33,21 @@
 #include "tent/runtime/topology.h"
 
 extern "C" cudaError_t tentNcclGinLaunchPut(
-    ncclDevComm_t dev_comm, int peer, int context_index,
-    ncclWindow_t dst_window, size_t dst_offset, ncclWindow_t src_window,
-    size_t src_offset, size_t bytes, unsigned long long signal_value,
-    cudaStream_t stream);
+    ncclDevComm_t dev_comm, int peer, int lanes, ncclWindow_t dst_window,
+    size_t dst_offset, ncclWindow_t src_window, size_t src_offset,
+    size_t total_bytes, unsigned long long signal_value, cudaStream_t stream);
 
 extern "C" cudaError_t tentNcclGinLaunchGet(
-    ncclDevComm_t dev_comm, int peer, int context_index,
-    ncclWindow_t remote_window, size_t remote_offset, ncclWindow_t local_window,
-    size_t local_offset, size_t bytes, cudaStream_t stream);
+    ncclDevComm_t dev_comm, int peer, int lanes, ncclWindow_t remote_window,
+    size_t remote_offset, ncclWindow_t local_window, size_t local_offset,
+    size_t total_bytes, cudaStream_t stream);
+
+extern "C" cudaError_t tentNcclGinLaunchWaitSignal(
+    ncclDevComm_t dev_comm, int lanes, int signal_index,
+    unsigned long long signal_value, cudaStream_t stream);
 
 extern "C" cudaError_t tentNcclGinLaunchWaitAck(
-    ncclDevComm_t dev_comm, int peer, int context_index,
+    ncclDevComm_t dev_comm, int peer, int lanes,
     unsigned long long signal_value, cudaStream_t stream);
 
 namespace mooncake {
@@ -130,10 +133,6 @@ Status setCudaDevice(int device, int& previous_device) {
     return Status::OK();
 }
 
-size_t stripeOffset(size_t length, size_t lane, size_t lanes) {
-    return (length * lane) / lanes;
-}
-
 bool peerInLsaTeam(ncclComm_t comm, int peer_rank) {
     ncclTeam_t world = ncclTeamWorld(comm);
     ncclTeam_t lsa = ncclTeamLsa(comm);
@@ -160,7 +159,6 @@ struct NcclTransport::CommState {
     ncclDevComm_t dev_comm{};
     bool dev_comm_created = false;
     cudaStream_t completion_stream = nullptr;
-    std::vector<cudaStream_t> lane_streams;
     std::atomic<uint64_t> signal_epoch{0};
     size_t lanes = 1;
     Status status;
@@ -402,9 +400,6 @@ Status NcclTransport::uninstall() {
                     cudaStreamDestroy(comm->completion_stream);
                     comm->completion_stream = nullptr;
                 }
-                for (auto stream : comm->lane_streams) {
-                    if (stream) cudaStreamDestroy(stream);
-                }
                 if (status.ok()) cudaSetDevice(previous_device);
             }
         }
@@ -611,15 +606,6 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
                         lanes) {
                     status = Status::InternalError(
                         "NCCL dev comm did not provide requested GIN contexts" LOC_MARK);
-                }
-                if (status.ok()) {
-                    state->lane_streams.assign(lanes, nullptr);
-                    for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                        status = cudaStatus(
-                            cudaStreamCreateWithFlags(&state->lane_streams[lane],
-                                                      cudaStreamNonBlocking),
-                            "cudaStreamCreateWithFlags");
-                    }
                 }
                 if (status.ok()) {
                     status = cudaStatus(
@@ -879,15 +865,6 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
                     "NCCL remote dev comm did not provide requested GIN contexts" LOC_MARK);
             }
             if (status.ok()) {
-                state->lane_streams.assign(lanes, nullptr);
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                    status = cudaStatus(
-                        cudaStreamCreateWithFlags(&state->lane_streams[lane],
-                                                  cudaStreamNonBlocking),
-                        "cudaStreamCreateWithFlags(remote)");
-                }
-            }
-            if (status.ok()) {
                 status = cudaStatus(
                     cudaStreamCreateWithFlags(&state->completion_stream,
                                               cudaStreamNonBlocking),
@@ -1044,30 +1021,21 @@ Status NcclTransport::onWaitNcclSignal(const NcclSignalDesc& request,
         const uint64_t signal_value =
             request.signal_value ? request.signal_value : request.op_count;
         if (status.ok() && request.put_signal) {
-            const size_t lanes = comm_state->lanes;
-            for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                const size_t begin = stripeOffset(request.length, lane, lanes);
-                const size_t end = stripeOffset(request.length, lane + 1, lanes);
-                const size_t bytes = end - begin;
-                auto err = tentNcclGinLaunchPut(
-                    comm_state->dev_comm, request.peer,
-                    static_cast<int>(lane), window_state->window,
-                    request.peer_window_offset + begin,
-                    source_window_state->window, request.source_addr + begin,
-                    bytes, static_cast<unsigned long long>(signal_value),
-                    comm_state->lane_streams[lane]);
-                status = cudaStatus(err, "tentNcclGinLaunchPut(remote)");
-            }
+            auto err = tentNcclGinLaunchPut(
+                comm_state->dev_comm, request.peer,
+                static_cast<int>(comm_state->lanes), window_state->window,
+                request.peer_window_offset, source_window_state->window,
+                request.source_addr, request.length,
+                static_cast<unsigned long long>(signal_value),
+                comm_state->completion_stream);
+            status = cudaStatus(err, "tentNcclGinLaunchPut(remote)");
         } else if (status.ok()) {
-            for (size_t lane = 0; lane < comm_state->lanes && status.ok();
-                 ++lane) {
-                auto err = tentNcclGinLaunchWaitAck(
-                    comm_state->dev_comm, request.peer,
-                    static_cast<int>(lane),
-                    static_cast<unsigned long long>(signal_value),
-                    comm_state->lane_streams[lane]);
-                status = cudaStatus(err, "tentNcclGinLaunchWaitAck(remote)");
-            }
+            auto err = tentNcclGinLaunchWaitAck(
+                comm_state->dev_comm, request.peer,
+                static_cast<int>(comm_state->lanes),
+                static_cast<unsigned long long>(signal_value),
+                comm_state->completion_stream);
+            status = cudaStatus(err, "tentNcclGinLaunchWaitAck(remote)");
         }
         if (device_changed) cudaSetDevice(previous_device);
         if (!status.ok()) {
@@ -1110,89 +1078,46 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
         status = setCudaDevice(ctx.local_device, previous_device);
         bool device_changed = status.ok();
         cudaEvent_t event = nullptr;
-        auto join_lane_streams = [&]() -> Status {
-            for (size_t lane = 0; lane < comm_state->lane_streams.size();
-                 ++lane) {
-                cudaEvent_t lane_event = nullptr;
-                auto err = cudaEventCreateWithFlags(&lane_event,
-                                                    cudaEventDisableTiming);
-                if (err != cudaSuccess) {
-                    return Status::InternalError(
-                        std::string("cudaEventCreateWithFlags(lane): ") +
-                        cudaGetErrorString(err) + LOC_MARK);
-                }
-                err = cudaEventRecord(lane_event,
-                                      comm_state->lane_streams[lane]);
-                if (err == cudaSuccess) {
-                    err = cudaStreamWaitEvent(comm_state->completion_stream,
-                                              lane_event, 0);
-                }
-                cudaEventDestroy(lane_event);
-                if (err != cudaSuccess) {
-                    return Status::InternalError(
-                        std::string("cudaStreamWaitEvent(lane): ") +
-                        cudaGetErrorString(err) + LOC_MARK);
-                }
-            }
-            return Status::OK();
-        };
         if (status.ok()) {
-            const size_t lanes = comm_state->lanes;
+            const int lanes = static_cast<int>(comm_state->lanes);
             if (use_lsa) {
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                    const size_t begin = stripeOffset(task->request.length,
-                                                      lane, lanes);
-                    const size_t end = stripeOffset(task->request.length,
-                                                    lane + 1, lanes);
-                    const size_t bytes = end - begin;
-                    if (bytes == 0) continue;
-                    void* peer_ptr = nullptr;
-                    status = getLsaPeerPointer(
-                        window_state->window, ctx.target_offset + begin,
-                        comm_state->peer_rank, &peer_ptr);
-                    if (!status.ok()) break;
-                    void* local_ptr =
-                        reinterpret_cast<void*>(ctx.source_base + begin);
+                void* peer_ptr = nullptr;
+                status = getLsaPeerPointer(window_state->window,
+                                           ctx.target_offset,
+                                           comm_state->peer_rank,
+                                           &peer_ptr);
+                if (status.ok()) {
+                    void* local_ptr = reinterpret_cast<void*>(ctx.source_base);
                     auto err = cudaMemcpyAsync(
                         is_read ? local_ptr : peer_ptr,
-                        is_read ? peer_ptr : local_ptr, bytes,
+                        is_read ? peer_ptr : local_ptr, task->request.length,
                         cudaMemcpyDeviceToDevice,
-                        comm_state->lane_streams[lane]);
+                        comm_state->completion_stream);
                     status = cudaStatus(err, "cudaMemcpyAsync(NCCL LSA)");
                 }
             } else if (is_read) {
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                    const size_t begin = stripeOffset(task->request.length,
-                                                      lane, lanes);
-                    const size_t end = stripeOffset(task->request.length,
-                                                    lane + 1, lanes);
-                    const size_t bytes = end - begin;
-                    if (bytes == 0) continue;
-                    auto err = tentNcclGinLaunchGet(
-                        comm_state->dev_comm, comm_state->peer_rank,
-                        static_cast<int>(lane), window_state->window,
-                        ctx.target_offset + begin, source_window_state->window,
-                        begin, bytes, comm_state->lane_streams[lane]);
-                    status = cudaStatus(err, "tentNcclGinLaunchGet");
-                }
+                auto err = tentNcclGinLaunchGet(
+                    comm_state->dev_comm, comm_state->peer_rank, lanes,
+                    window_state->window, ctx.target_offset,
+                    source_window_state->window, 0, task->request.length,
+                    comm_state->completion_stream);
+                status = cudaStatus(err, "tentNcclGinLaunchGet");
             } else {
-                for (size_t lane = 0; lane < lanes && status.ok(); ++lane) {
-                    const size_t begin = stripeOffset(task->request.length,
-                                                      lane, lanes);
-                    const size_t end = stripeOffset(task->request.length,
-                                                    lane + 1, lanes);
-                    const size_t bytes = end - begin;
-                    auto err = tentNcclGinLaunchPut(
-                        comm_state->dev_comm, comm_state->peer_rank,
-                        static_cast<int>(lane), window_state->window,
-                        ctx.target_offset + begin, source_window_state->window,
-                        begin, bytes,
+                auto err = tentNcclGinLaunchPut(
+                    comm_state->dev_comm, comm_state->peer_rank, lanes,
+                    window_state->window, ctx.target_offset,
+                    source_window_state->window, 0, task->request.length,
+                    static_cast<unsigned long long>(signal_value),
+                    comm_state->completion_stream);
+                status = cudaStatus(err, "tentNcclGinLaunchPut");
+                if (status.ok()) {
+                    err = tentNcclGinLaunchWaitSignal(
+                        comm_state->dev_comm, lanes, 1,
                         static_cast<unsigned long long>(signal_value),
-                        comm_state->lane_streams[lane]);
-                    status = cudaStatus(err, "tentNcclGinLaunchPut");
+                        comm_state->completion_stream);
+                    status = cudaStatus(err, "tentNcclGinLaunchWaitSignal");
                 }
             }
-            if (status.ok()) status = join_lane_streams();
             if (status.ok()) {
                 auto err = cudaEventCreateWithFlags(&event,
                                                     cudaEventDisableTiming);
