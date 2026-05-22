@@ -244,6 +244,8 @@ Status NcclTransport::install(std::string& local_segment_name,
                        params_.max_concurrent_tasks);
         params_.gin_lanes =
             conf_->get("transports/nccl/gin_lanes", params_.gin_lanes);
+        params_.wait_ack =
+            conf_->get("transports/nccl/wait_ack", params_.wait_ack);
     }
     if (params_.max_concurrent_tasks == 0) params_.max_concurrent_tasks = 1;
     if (params_.gin_lanes == 0) params_.gin_lanes = 1;
@@ -289,7 +291,8 @@ Status NcclTransport::install(std::string& local_segment_name,
               << " allow_external_window_buffers="
               << allow_external_window_buffers_
               << " max_concurrent_tasks=" << params_.max_concurrent_tasks
-              << " gin_lanes=" << params_.gin_lanes;
+              << " gin_lanes=" << params_.gin_lanes
+              << " wait_ack=" << params_.wait_ack;
     return Status::OK();
 }
 
@@ -1065,12 +1068,14 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
     if (status.ok() && !use_lsa) {
         status = ensureSourceWindow(ctx, comm_state, source_window_state);
     }
-    const uint64_t signal_value = status.ok() && !use_lsa && !is_read
-                                      ? comm_state->signal_epoch.fetch_add(
-                                            1, std::memory_order_acq_rel) +
-                                            1
-                                      : 0;
-    if (status.ok() && !is_read && !use_lsa) {
+    const bool wait_ack =
+        params_.wait_ack && status.ok() && !use_lsa && !is_read;
+    const uint64_t signal_value =
+        wait_ack ? comm_state->signal_epoch.fetch_add(
+                       1, std::memory_order_acq_rel) +
+                       1
+                 : 0;
+    if (status.ok() && wait_ack) {
         status = postRemoteWaitSignal(ctx, signal_value);
     }
     if (status.ok()) {
@@ -1110,7 +1115,7 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
                     static_cast<unsigned long long>(signal_value),
                     comm_state->completion_stream);
                 status = cudaStatus(err, "tentNcclGinLaunchPut");
-                if (status.ok()) {
+                if (status.ok() && wait_ack) {
                     err = tentNcclGinLaunchWaitSignal(
                         comm_state->dev_comm, lanes, 1,
                         static_cast<unsigned long long>(signal_value),

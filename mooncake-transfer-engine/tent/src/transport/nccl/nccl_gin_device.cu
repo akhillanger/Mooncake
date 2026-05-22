@@ -36,9 +36,16 @@ __global__ void ncclGinPutKernel(ncclDevComm comm, int peer, int lanes,
     ncclTeam world = ncclTeamWorld(comm);
     ncclGin gin(comm, lane);
     const ncclCoopCta coop = ncclCoopCta();
-    gin.put(world, peer, dst_window, dst_offset + begin, src_window,
-            src_offset + begin, end - begin, ncclGin_StrongSignalInc{0},
-            ncclGin_None{}, coop);
+    if (data_signal_value) {
+        gin.put(world, peer, dst_window, dst_offset + begin, src_window,
+                src_offset + begin, end - begin, ncclGin_StrongSignalInc{0},
+                ncclGin_None{}, coop);
+    } else {
+        gin.put(world, peer, dst_window, dst_offset + begin, src_window,
+                src_offset + begin, end - begin, ncclGin_None{},
+                ncclGin_None{}, coop);
+    }
+    gin.flush(coop);
 #endif
 }
 
