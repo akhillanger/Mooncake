@@ -43,7 +43,7 @@ extern "C" cudaError_t tentNcclGinLaunchGet(
     size_t total_bytes, cudaStream_t stream);
 
 extern "C" cudaError_t tentNcclGinLaunchWaitSignal(
-    ncclDevComm_t dev_comm, int lanes, int signal_index,
+    ncclDevComm_t dev_comm, int lanes, int signal_base,
     unsigned long long signal_value, cudaStream_t stream);
 
 extern "C" cudaError_t tentNcclGinLaunchWaitAck(
@@ -597,7 +597,9 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
                     reqs.ginForceEnable = true;
                     reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
                     reqs.ginContextCount = static_cast<int>(lanes);
-                    reqs.ginSignalCount = 2;
+                    // Data completion uses [0, lanes); wait-ack uses
+                    // [lanes, 2 * lanes).
+                    reqs.ginSignalCount = static_cast<int>(lanes * 2);
                     status = ncclStatus(
                         ncclDevCommCreate(state->comm, &reqs,
                                           &state->dev_comm),
@@ -855,7 +857,9 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
                 reqs.ginForceEnable = true;
                 reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
                 reqs.ginContextCount = static_cast<int>(lanes);
-                reqs.ginSignalCount = 2;
+                // Data completion uses [0, lanes); wait-ack uses
+                // [lanes, 2 * lanes).
+                reqs.ginSignalCount = static_cast<int>(lanes * 2);
                 status = ncclStatus(
                     ncclDevCommCreate(state->comm, &reqs,
                                       &state->dev_comm),
@@ -1117,7 +1121,7 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
                 status = cudaStatus(err, "tentNcclGinLaunchPut");
                 if (status.ok() && wait_ack) {
                     err = tentNcclGinLaunchWaitSignal(
-                        comm_state->dev_comm, lanes, 1,
+                        comm_state->dev_comm, lanes, lanes,
                         static_cast<unsigned long long>(signal_value),
                         comm_state->completion_stream);
                     status = cudaStatus(err, "tentNcclGinLaunchWaitSignal");

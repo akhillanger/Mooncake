@@ -16,6 +16,8 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include "tent/transport/nccl/paged_gin.h"
+
 namespace {
 
 __device__ size_t stripeOffset(size_t length, int lane, int lanes) {
@@ -33,31 +35,36 @@ __global__ void ncclGinPutKernel(ncclDevComm comm, int peer, int lanes,
     if (lane >= lanes) return;
     const size_t begin = stripeOffset(total_bytes, lane, lanes);
     const size_t end = stripeOffset(total_bytes, lane + 1, lanes);
+    const size_t bytes = end - begin;
     ncclTeam world = ncclTeamWorld(comm);
     ncclGin gin(comm, lane);
     const ncclCoopCta coop = ncclCoopCta();
     if (data_signal_value) {
+        if (bytes) {
+            gin.put(world, peer, dst_window, dst_offset + begin, src_window,
+                    src_offset + begin, bytes, ncclGin_StrongSignalInc{lane},
+                    ncclGin_None{}, coop);
+        } else {
+            gin.signal(world, peer, ncclGin_StrongSignalInc{lane}, coop);
+        }
+    } else if (bytes) {
         gin.put(world, peer, dst_window, dst_offset + begin, src_window,
-                src_offset + begin, end - begin, ncclGin_StrongSignalInc{0},
-                ncclGin_None{}, coop);
-    } else {
-        gin.put(world, peer, dst_window, dst_offset + begin, src_window,
-                src_offset + begin, end - begin, ncclGin_None{},
-                ncclGin_None{}, coop);
+                src_offset + begin, bytes, ncclGin_None{}, ncclGin_None{},
+                coop);
     }
     gin.flush(coop);
 #endif
 }
 
 __global__ void ncclGinWaitSignalKernel(ncclDevComm comm, int lanes,
-                                        int signal_index,
+                                        int signal_base,
                                         unsigned long long signal_value) {
 #if __CUDA_ARCH__ >= 700
     const int lane = static_cast<int>(blockIdx.x);
     if (lane >= lanes) return;
     ncclGin gin(comm, lane);
     const ncclCoopCta coop = ncclCoopCta();
-    gin.waitSignal(coop, signal_index, signal_value);
+    gin.waitSignal(coop, signal_base + lane, signal_value);
 #endif
 }
 
@@ -83,16 +90,77 @@ __global__ void ncclGinGetKernel(ncclDevComm comm, int peer, int lanes,
 }
 
 __global__ void ncclGinWaitAckKernel(ncclDevComm comm, int peer, int lanes,
-                                     unsigned long long data_signal_value,
-                                     unsigned long long ack_signal_value) {
+                                     unsigned long long data_signal_value) {
 #if __CUDA_ARCH__ >= 700
     const int lane = static_cast<int>(blockIdx.x);
     if (lane >= lanes) return;
     ncclTeam world = ncclTeamWorld(comm);
     ncclGin gin(comm, lane);
     const ncclCoopCta coop = ncclCoopCta();
-    gin.waitSignal(coop, 0, data_signal_value);
-    gin.signal(world, peer, ncclGin_StrongSignalInc{1}, coop);
+    gin.waitSignal(coop, lane, data_signal_value);
+    gin.signal(world, peer, ncclGin_StrongSignalInc{lanes + lane}, coop);
+#endif
+}
+
+__global__ void ncclGinPagedPutKernel(
+    ncclDevComm comm, int peer, int lanes, ncclWindow_t dst_window,
+    ncclWindow_t src_window, TentNcclPagedKvLayout layout,
+    const TentNcclPagedTransferJob* jobs, int num_jobs,
+    unsigned long long signal_value) {
+#if __CUDA_ARCH__ >= 700
+    const int lane = static_cast<int>(blockIdx.x);
+    if (lane >= lanes) return;
+    if (layout.page_stride_bytes == 0) return;
+    if (num_jobs > 0 && !jobs) return;
+
+    ncclTeam world = ncclTeamWorld(comm);
+    ncclGin gin(comm, lane);
+    const ncclCoopCta coop = ncclCoopCta();
+
+    for (int job_index = 0; job_index < num_jobs; ++job_index) {
+        const TentNcclPagedTransferJob job = jobs[job_index];
+        const int layer_count = job.layer_end - job.layer_begin;
+        if (job.num_pages <= 0 || layer_count <= 0 || job.layer_begin < 0 ||
+            !job.src_page_table || !job.dst_page_table) {
+            continue;
+        }
+
+        const unsigned long long job_work =
+            static_cast<unsigned long long>(job.num_pages) *
+            static_cast<unsigned long long>(layer_count);
+        for (unsigned long long work = static_cast<unsigned long long>(lane);
+             work < job_work; work += static_cast<unsigned long long>(lanes)) {
+            const int page_slot =
+                static_cast<int>(work %
+                                 static_cast<unsigned long long>(
+                                     job.num_pages));
+            const int layer =
+                job.layer_begin +
+                static_cast<int>(work /
+                                 static_cast<unsigned long long>(
+                                     job.num_pages));
+            const int src_page = job.src_page_table[page_slot];
+            const int dst_page = job.dst_page_table[page_slot];
+            if (src_page < 0 || dst_page < 0) continue;
+
+            const size_t src_offset =
+                static_cast<size_t>(layer) * job.src_layer_stride +
+                static_cast<size_t>(src_page) * layout.page_stride_bytes;
+            const size_t dst_offset =
+                static_cast<size_t>(layer) * job.dst_layer_stride +
+                static_cast<size_t>(dst_page) * layout.page_stride_bytes;
+            gin.put(world, peer, dst_window, dst_offset, src_window,
+                    src_offset, layout.page_stride_bytes, ncclGin_None{},
+                    ncclGin_None{}, coop);
+        }
+    }
+
+    // One CTA owns each GIN context. Signal slot == lane, so each slot is
+    // ordered after every page put issued on its matching context.
+    gin.flush(coop);
+    if (signal_value) {
+        gin.signal(world, peer, ncclGin_StrongSignalInc{lane}, coop);
+    }
 #endif
 }
 
@@ -115,11 +183,11 @@ extern "C" cudaError_t tentNcclGinLaunchPut(ncclDevComm_t dev_comm, int peer,
 }
 
 extern "C" cudaError_t tentNcclGinLaunchWaitSignal(
-    ncclDevComm_t dev_comm, int lanes, int signal_index,
+    ncclDevComm_t dev_comm, int lanes, int signal_base,
     unsigned long long signal_value, cudaStream_t stream) {
     if (lanes <= 0) return cudaErrorInvalidValue;
     ncclGinWaitSignalKernel<<<lanes, 128, 0, stream>>>(
-        dev_comm, lanes, signal_index, signal_value);
+        dev_comm, lanes, signal_base, signal_value);
     return cudaGetLastError();
 }
 
@@ -144,6 +212,21 @@ extern "C" cudaError_t tentNcclGinLaunchWaitAck(ncclDevComm_t dev_comm,
                                                  cudaStream_t stream) {
     if (lanes <= 0) return cudaErrorInvalidValue;
     ncclGinWaitAckKernel<<<lanes, 128, 0, stream>>>(
-        dev_comm, peer, lanes, signal_value, signal_value);
+        dev_comm, peer, lanes, signal_value);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t tentNcclGinLaunchPagedPut(
+    ncclDevComm_t dev_comm, int peer, int lanes, ncclWindow_t dst_window,
+    ncclWindow_t src_window, TentNcclPagedKvLayout layout,
+    const TentNcclPagedTransferJob* jobs, int num_jobs,
+    unsigned long long signal_value, cudaStream_t stream) {
+    if (lanes <= 0 || num_jobs < 0 || layout.page_stride_bytes == 0 ||
+        (num_jobs > 0 && !jobs)) {
+        return cudaErrorInvalidValue;
+    }
+    ncclGinPagedPutKernel<<<lanes, 128, 0, stream>>>(
+        dev_comm, peer, lanes, dst_window, src_window, layout, jobs, num_jobs,
+        signal_value);
     return cudaGetLastError();
 }
