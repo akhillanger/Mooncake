@@ -19,4 +19,21 @@ if (NCCL_HAS_HOST_RMA)
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES 100)
+
+    add_executable(tent_nccl_paged_gin_bench EXCLUDE_FROM_ALL
+        bench/paged_gin_bench.cu
+        nccl_gin_device.cu)
+    target_link_libraries(tent_nccl_paged_gin_bench PRIVATE
+        CUDA::cudart ${NCCL_LIB})
+    target_include_directories(tent_nccl_paged_gin_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
+        ${NCCL_INCLUDE_DIR})
+    target_compile_definitions(tent_nccl_paged_gin_bench PRIVATE
+        NCCL_DEVICE_PERMIT_EXPERIMENTAL_CODE=1)
+    target_compile_options(tent_nccl_paged_gin_bench PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    set_target_properties(tent_nccl_paged_gin_bench PROPERTIES
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES 100)
 endif()

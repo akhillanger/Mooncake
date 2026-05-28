@@ -42,10 +42,15 @@ __global__ void ncclGinPutKernel(ncclDevComm comm, int peer, int lanes,
     if (data_signal_value) {
         if (bytes) {
             gin.put(world, peer, dst_window, dst_offset + begin, src_window,
-                    src_offset + begin, bytes, ncclGin_StrongSignalInc{lane},
+                    src_offset + begin, bytes,
+                    ncclGin_StrongSignalInc{
+                        static_cast<unsigned int>(lane)},
                     ncclGin_None{}, coop);
         } else {
-            gin.signal(world, peer, ncclGin_StrongSignalInc{lane}, coop);
+            gin.signal(world, peer,
+                       ncclGin_StrongSignalInc{
+                           static_cast<unsigned int>(lane)},
+                       coop);
         }
     } else if (bytes) {
         gin.put(world, peer, dst_window, dst_offset + begin, src_window,
@@ -98,7 +103,10 @@ __global__ void ncclGinWaitAckKernel(ncclDevComm comm, int peer, int lanes,
     ncclGin gin(comm, lane);
     const ncclCoopCta coop = ncclCoopCta();
     gin.waitSignal(coop, lane, data_signal_value);
-    gin.signal(world, peer, ncclGin_StrongSignalInc{lanes + lane}, coop);
+    gin.signal(world, peer,
+               ncclGin_StrongSignalInc{
+                   static_cast<unsigned int>(lanes + lane)},
+               coop);
 #endif
 }
 
@@ -114,8 +122,19 @@ __global__ void ncclGinPagedPutKernel(
     if (num_jobs > 0 && !jobs) return;
 
     ncclTeam world = ncclTeamWorld(comm);
-    ncclGin gin(comm, lane);
-    const ncclCoopCta coop = ncclCoopCta();
+    const ncclGinResourceSharingMode sharing =
+        static_cast<ncclGinResourceSharingMode>(layout.gin_resource_sharing);
+    ncclGin gin(comm, lane, sharing);
+    const uint32_t gin_opt_flags = layout.gin_opt_flags;
+    const ncclCoopThread thread_coop = ncclCoopThread();
+    const ncclCoopCta cta_coop = ncclCoopCta();
+    const unsigned long long thread_rank =
+        static_cast<unsigned long long>(lane) *
+            static_cast<unsigned long long>(blockDim.x) +
+        static_cast<unsigned long long>(threadIdx.x);
+    const unsigned long long thread_count =
+        static_cast<unsigned long long>(lanes) *
+        static_cast<unsigned long long>(blockDim.x);
 
     for (int job_index = 0; job_index < num_jobs; ++job_index) {
         const TentNcclPagedTransferJob job = jobs[job_index];
@@ -128,8 +147,8 @@ __global__ void ncclGinPagedPutKernel(
         const unsigned long long job_work =
             static_cast<unsigned long long>(job.num_pages) *
             static_cast<unsigned long long>(layer_count);
-        for (unsigned long long work = static_cast<unsigned long long>(lane);
-             work < job_work; work += static_cast<unsigned long long>(lanes)) {
+        for (unsigned long long work = thread_rank; work < job_work;
+             work += thread_count) {
             const int page_slot =
                 static_cast<int>(work %
                                  static_cast<unsigned long long>(
@@ -144,22 +163,29 @@ __global__ void ncclGinPagedPutKernel(
             if (src_page < 0 || dst_page < 0) continue;
 
             const size_t src_offset =
+                job.src_base_offset +
                 static_cast<size_t>(layer) * job.src_layer_stride +
                 static_cast<size_t>(src_page) * layout.page_stride_bytes;
             const size_t dst_offset =
+                job.dst_base_offset +
                 static_cast<size_t>(layer) * job.dst_layer_stride +
                 static_cast<size_t>(dst_page) * layout.page_stride_bytes;
             gin.put(world, peer, dst_window, dst_offset, src_window,
                     src_offset, layout.page_stride_bytes, ncclGin_None{},
-                    ncclGin_None{}, coop);
+                    ncclGin_None{}, thread_coop, ncclGin_None{},
+                    cuda::thread_scope_thread, cuda::thread_scope_device,
+                    gin_opt_flags);
         }
     }
 
-    // One CTA owns each GIN context. Signal slot == lane, so each slot is
-    // ordered after every page put issued on its matching context.
-    gin.flush(coop);
+    // One CTA owns each GIN context. The CTA-wide flush orders all thread-scope
+    // puts posted by that lane before the lane-local completion signal.
+    gin.flush(cta_coop);
     if (signal_value) {
-        gin.signal(world, peer, ncclGin_StrongSignalInc{lane}, coop);
+        gin.signal(world, peer,
+                       ncclGin_StrongSignalInc{
+                           static_cast<unsigned int>(lane)},
+                       cta_coop);
     }
 #endif
 }

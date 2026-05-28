@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -31,6 +32,7 @@
 #include "tent/runtime/segment.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/topology.h"
+#include "tent/transport/nccl/paged_gin.h"
 
 extern "C" cudaError_t tentNcclGinLaunchPut(
     ncclDevComm_t dev_comm, int peer, int lanes, ncclWindow_t dst_window,
@@ -246,6 +248,11 @@ Status NcclTransport::install(std::string& local_segment_name,
             conf_->get("transports/nccl/gin_lanes", params_.gin_lanes);
         params_.wait_ack =
             conf_->get("transports/nccl/wait_ack", params_.wait_ack);
+        params_.force_gin =
+            conf_->get("transports/nccl/force_gin", params_.force_gin);
+    }
+    if (std::getenv("MC_NCCL_FORCE_GIN")) {
+        params_.force_gin = true;
     }
     if (params_.max_concurrent_tasks == 0) params_.max_concurrent_tasks = 1;
     if (params_.gin_lanes == 0) params_.gin_lanes = 1;
@@ -292,7 +299,8 @@ Status NcclTransport::install(std::string& local_segment_name,
               << allow_external_window_buffers_
               << " max_concurrent_tasks=" << params_.max_concurrent_tasks
               << " gin_lanes=" << params_.gin_lanes
-              << " wait_ack=" << params_.wait_ack;
+              << " wait_ack=" << params_.wait_ack
+              << " force_gin=" << params_.force_gin;
     return Status::OK();
 }
 
@@ -458,6 +466,13 @@ Status NcclTransport::markFailed(NcclTask& task, const std::string& reason) {
 
 Status NcclTransport::buildTransferContext(const Request& request,
                                            TransferContext& ctx) {
+    return buildTransferContext(request, request.length, request.length, ctx);
+}
+
+Status NcclTransport::buildTransferContext(const Request& request,
+                                           size_t source_length,
+                                           size_t target_length,
+                                           TransferContext& ctx) {
     if (request.target_id == LOCAL_SEGMENT_ID) {
         return Status::InvalidArgument(
             "NCCL host RMA expects a remote target segment" LOC_MARK);
@@ -486,7 +501,7 @@ Status NcclTransport::buildTransferContext(const Request& request,
                     "NCCL target segment is not memory" LOC_MARK);
             }
             auto* buffer = segment->findBuffer(request.target_offset,
-                                              request.length);
+                                              target_length);
             if (!buffer) {
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
@@ -509,7 +524,7 @@ Status NcclTransport::buildTransferContext(const Request& request,
     ctx.target_length = target_buffer.length;
     ctx.target_offset = request.target_offset - target_buffer.addr;
     ctx.source_base = reinterpret_cast<uint64_t>(request.source);
-    ctx.source_length = request.length;
+    ctx.source_length = source_length;
     ctx.local_device = local_location.index();
     ctx.remote_device = remote_location.index();
     ctx.session_key = makeSessionKey(local_segment_name_,
@@ -591,7 +606,7 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
                     state->peer_in_lsa = peerInLsaTeam(state->comm,
                                                        state->peer_rank);
                 }
-                if (status.ok() && !state->peer_in_lsa) {
+                if (status.ok() && (!state->peer_in_lsa || params_.force_gin)) {
                     ncclDevCommRequirements_t reqs =
                         NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
                     reqs.ginForceEnable = true;
@@ -600,13 +615,20 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
                     // Data completion uses [0, lanes); wait-ack uses
                     // [lanes, 2 * lanes).
                     reqs.ginSignalCount = static_cast<int>(lanes * 2);
-                    status = ncclStatus(
-                        ncclDevCommCreate(state->comm, &reqs,
-                                          &state->dev_comm),
-                        "ncclDevCommCreate");
+                    status = ncclStatus(ncclGroupStart(),
+                                        "ncclGroupStart(dev comm)");
+                    if (status.ok()) {
+                        Status create_status = ncclStatus(
+                            ncclDevCommCreate(state->comm, &reqs,
+                                              &state->dev_comm),
+                            "ncclDevCommCreate");
+                        Status group_status = ncclStatus(ncclGroupEnd(),
+                                                        "ncclGroupEnd(dev comm)");
+                        status = create_status.ok() ? group_status : create_status;
+                    }
                     state->dev_comm_created = status.ok();
                 }
-                if (status.ok() && !state->peer_in_lsa &&
+                if (status.ok() && (!state->peer_in_lsa || params_.force_gin) &&
                     static_cast<size_t>(state->dev_comm.ginContextCount) <
                         lanes) {
                     status = Status::InternalError(
@@ -826,7 +848,7 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
 
     if (!should_init) return Status::OK();
 
-    startBackground([state, request]() {
+    startBackground([this, state, request]() {
         Status status;
         const size_t lanes = request.comm_count > 0
                                  ? static_cast<size_t>(request.comm_count)
@@ -851,7 +873,7 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
                 state->peer_in_lsa = peerInLsaTeam(state->comm,
                                                    state->peer_rank);
             }
-            if (status.ok() && !state->peer_in_lsa) {
+            if (status.ok() && (!state->peer_in_lsa || params_.force_gin)) {
                 ncclDevCommRequirements_t reqs =
                     NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
                 reqs.ginForceEnable = true;
@@ -860,13 +882,20 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
                 // Data completion uses [0, lanes); wait-ack uses
                 // [lanes, 2 * lanes).
                 reqs.ginSignalCount = static_cast<int>(lanes * 2);
-                status = ncclStatus(
-                    ncclDevCommCreate(state->comm, &reqs,
-                                      &state->dev_comm),
-                    "ncclDevCommCreate(remote)");
+                status = ncclStatus(ncclGroupStart(),
+                                    "ncclGroupStart(remote dev comm)");
+                if (status.ok()) {
+                    Status create_status = ncclStatus(
+                        ncclDevCommCreate(state->comm, &reqs,
+                                          &state->dev_comm),
+                        "ncclDevCommCreate(remote)");
+                    Status group_status = ncclStatus(ncclGroupEnd(),
+                                                    "ncclGroupEnd(remote dev comm)");
+                    status = create_status.ok() ? group_status : create_status;
+                }
                 state->dev_comm_created = status.ok();
             }
-            if (status.ok() && !state->peer_in_lsa &&
+            if (status.ok() && (!state->peer_in_lsa || params_.force_gin) &&
                 static_cast<size_t>(state->dev_comm.ginContextCount) < lanes) {
                 status = Status::InternalError(
                     "NCCL remote dev comm did not provide requested GIN contexts" LOC_MARK);
@@ -1067,7 +1096,8 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
     if (status.ok()) status = ensureComm(ctx, comm_state);
     std::shared_ptr<WindowState> window_state;
     if (status.ok()) status = ensureWindow(ctx, comm_state, window_state);
-    const bool use_lsa = status.ok() && comm_state->peer_in_lsa;
+    const bool use_lsa =
+        status.ok() && comm_state->peer_in_lsa && !params_.force_gin;
     std::shared_ptr<WindowState> source_window_state;
     if (status.ok() && !use_lsa) {
         status = ensureSourceWindow(ctx, comm_state, source_window_state);
@@ -1155,6 +1185,283 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
     }
 
     if (!status.ok()) markFailed(*task, status.ToString());
+}
+
+Status NcclTransport::transferPagedSync(
+    const PagedTransferRequest& request) {
+    if (!installed_ || !thread_pool_) {
+        return Status::InternalError(
+            "NCCL transport is not installed" LOC_MARK);
+    }
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        return Status::InvalidArgument(
+            "NCCL transport is shutting down" LOC_MARK);
+    }
+    if (params_.wait_ack) {
+        return Status::NotImplemented(
+            "NCCL paged sync wait_ack is not implemented yet" LOC_MARK);
+    }
+    if (request.page_bytes == 0) {
+        return Status::InvalidArgument(
+            "Paged transfer page_bytes must be nonzero" LOC_MARK);
+    }
+    if (request.src_layer_ptrs.size() != request.dst_layer_ptrs.size()) {
+        return Status::InvalidArgument(
+            "Paged transfer source and destination layer counts differ"
+            LOC_MARK);
+    }
+    if (request.src_page_indices.size() != request.dst_page_indices.size()) {
+        return Status::InvalidArgument(
+            "Paged transfer source and destination page tables differ"
+            LOC_MARK);
+    }
+
+    const size_t layer_count = request.src_layer_ptrs.size();
+    const size_t page_count = request.src_page_indices.size();
+    if (layer_count == 0 || page_count == 0) return Status::OK();
+    if (page_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return Status::InvalidArgument(
+            "Paged transfer page table is too large" LOC_MARK);
+    }
+    if (page_count > std::numeric_limits<size_t>::max() / sizeof(int32_t)) {
+        return Status::InvalidArgument(
+            "Paged transfer page table byte size overflows" LOC_MARK);
+    }
+
+    bool has_valid_pages = false;
+    int32_t max_src_page = 0;
+    int32_t max_dst_page = 0;
+    for (size_t i = 0; i < page_count; ++i) {
+        const int32_t src_page = request.src_page_indices[i];
+        const int32_t dst_page = request.dst_page_indices[i];
+        if (src_page < 0 || dst_page < 0) continue;
+        if (!has_valid_pages) {
+            max_src_page = src_page;
+            max_dst_page = dst_page;
+            has_valid_pages = true;
+        } else {
+            max_src_page = std::max(max_src_page, src_page);
+            max_dst_page = std::max(max_dst_page, dst_page);
+        }
+    }
+    if (!has_valid_pages) return Status::OK();
+
+    auto page_span = [&](int32_t max_page, const char* name,
+                         size_t& span) -> Status {
+        const size_t pages = static_cast<size_t>(max_page) + 1;
+        if (pages > std::numeric_limits<size_t>::max() / request.page_bytes) {
+            return Status::InvalidArgument(
+                std::string(name) + " byte size overflows" LOC_MARK);
+        }
+        span = pages * request.page_bytes;
+        return Status::OK();
+    };
+
+    size_t source_span = 0;
+    size_t target_span = 0;
+    CHECK_STATUS(page_span(max_src_page, "Paged source span", source_span));
+    CHECK_STATUS(page_span(max_dst_page, "Paged target span", target_span));
+
+    std::vector<TransferContext> contexts;
+    contexts.reserve(layer_count);
+    for (size_t layer = 0; layer < layer_count; ++layer) {
+        if (!request.src_layer_ptrs[layer]) {
+            return Status::InvalidArgument(
+                "Paged transfer source layer pointer is null" LOC_MARK);
+        }
+        Request layer_request;
+        layer_request.opcode = Request::WRITE;
+        layer_request.source = request.src_layer_ptrs[layer];
+        layer_request.target_id = request.target_id;
+        layer_request.target_offset = request.dst_layer_ptrs[layer];
+        layer_request.length = std::max(source_span, target_span);
+
+        TransferContext ctx;
+        CHECK_STATUS(buildTransferContext(layer_request, source_span,
+                                          target_span, ctx));
+        // Paged requests touch arbitrary KV pages over time. Register the full
+        // layer window once instead of overlapping per-request prefixes.
+        ctx.source_length = ctx.target_length;
+        ctx.source_window_key = makeWindowKey(ctx.session_key, "source",
+                                              ctx.source_base,
+                                              ctx.source_length);
+        if (!contexts.empty()) {
+            const auto& first = contexts.front();
+            if (ctx.local_device != first.local_device ||
+                ctx.remote_device != first.remote_device ||
+                ctx.session_key != first.session_key) {
+                return Status::InvalidArgument(
+                    "Paged transfer layers must use one NCCL session"
+                    LOC_MARK);
+            }
+        }
+        contexts.push_back(std::move(ctx));
+    }
+
+    std::shared_ptr<CommState> comm_state;
+    CHECK_STATUS(ensureComm(contexts.front(), comm_state));
+    // Paged KV issues one transfer per page per layer. The LSA path becomes a
+    // cudaMemcpyAsync page loop, which is much slower than fused GIN on GB200.
+    // Keep LSA for regular contiguous transfers, but route paged transfers to GIN
+    // even when the peer is in the local shared-address team.
+    const bool use_lsa = false;
+    if (!use_lsa && !comm_state->dev_comm_created) {
+        return Status::InvalidArgument(
+            "NCCL paged GIN requires a device communicator; set "
+            "MC_NCCL_FORCE_GIN=1 and NCCL_CUMEM_ENABLE=1 for LSA peers"
+            LOC_MARK);
+    }
+    const int lanes = static_cast<int>(comm_state->lanes);
+
+    int previous_device = 0;
+    Status status = setCudaDevice(contexts.front().local_device,
+                                  previous_device);
+    bool device_changed = status.ok();
+    int32_t* d_src_pages = nullptr;
+    int32_t* d_dst_pages = nullptr;
+    TentNcclPagedTransferJob* d_job = nullptr;
+    cudaEvent_t event = nullptr;
+    bool work_enqueued = false;
+
+    auto cleanup_device_allocations = [&]() {
+        auto free_one = [&](void* ptr, const char* name) {
+            if (!ptr) return;
+            auto err = cudaFree(ptr);
+            if (err != cudaSuccess) {
+                if (status.ok()) {
+                    status = cudaStatus(err, name);
+                } else {
+                    LOG(WARNING) << name << ": " << cudaGetErrorString(err);
+                }
+            }
+        };
+        free_one(d_job, "cudaFree(paged job)");
+        free_one(d_dst_pages, "cudaFree(paged dst pages)");
+        free_one(d_src_pages, "cudaFree(paged src pages)");
+    };
+
+    if (status.ok() && !use_lsa) {
+        const size_t page_table_bytes = page_count * sizeof(int32_t);
+        auto err = cudaMalloc(reinterpret_cast<void**>(&d_src_pages),
+                              page_table_bytes);
+        status = cudaStatus(err, "cudaMalloc(paged src pages)");
+        if (status.ok()) {
+            err = cudaMalloc(reinterpret_cast<void**>(&d_dst_pages),
+                             page_table_bytes);
+            status = cudaStatus(err, "cudaMalloc(paged dst pages)");
+        }
+        if (status.ok()) {
+            err = cudaMalloc(reinterpret_cast<void**>(&d_job),
+                             sizeof(TentNcclPagedTransferJob));
+            status = cudaStatus(err, "cudaMalloc(paged job)");
+        }
+        if (status.ok()) {
+            err = cudaMemcpyAsync(d_src_pages,
+                                  request.src_page_indices.data(),
+                                  page_table_bytes, cudaMemcpyHostToDevice,
+                                  comm_state->completion_stream);
+            status = cudaStatus(err, "cudaMemcpyAsync(paged src pages)");
+            if (status.ok()) work_enqueued = true;
+        }
+        if (status.ok()) {
+            err = cudaMemcpyAsync(d_dst_pages,
+                                  request.dst_page_indices.data(),
+                                  page_table_bytes, cudaMemcpyHostToDevice,
+                                  comm_state->completion_stream);
+            status = cudaStatus(err, "cudaMemcpyAsync(paged dst pages)");
+            if (status.ok()) work_enqueued = true;
+        }
+    }
+
+    TentNcclPagedKvLayout layout;
+    layout.page_stride_bytes = request.page_bytes;
+
+    for (size_t layer = 0; status.ok() && layer < contexts.size(); ++layer) {
+        const auto& ctx = contexts[layer];
+        std::shared_ptr<WindowState> window_state;
+        status = ensureWindow(ctx, comm_state, window_state);
+        if (!status.ok()) break;
+
+        if (use_lsa) {
+            void* peer_ptr = nullptr;
+            status = getLsaPeerPointer(window_state->window,
+                                       ctx.target_offset,
+                                       comm_state->peer_rank, &peer_ptr);
+            if (!status.ok()) break;
+            const char* src_base = reinterpret_cast<const char*>(
+                static_cast<uintptr_t>(ctx.source_base));
+            char* dst_base = static_cast<char*>(peer_ptr);
+            for (size_t page = 0; page < page_count; ++page) {
+                const int32_t src_page = request.src_page_indices[page];
+                const int32_t dst_page = request.dst_page_indices[page];
+                if (src_page < 0 || dst_page < 0) continue;
+                auto err = cudaMemcpyAsync(
+                    dst_base + static_cast<size_t>(dst_page) *
+                                   request.page_bytes,
+                    src_base + static_cast<size_t>(src_page) *
+                                   request.page_bytes,
+                    request.page_bytes, cudaMemcpyDeviceToDevice,
+                    comm_state->completion_stream);
+                status = cudaStatus(err, "cudaMemcpyAsync(NCCL paged LSA)");
+                if (!status.ok()) break;
+                work_enqueued = true;
+            }
+            continue;
+        }
+
+        std::shared_ptr<WindowState> source_window_state;
+        status = ensureSourceWindow(ctx, comm_state, source_window_state);
+        if (!status.ok()) break;
+
+        TentNcclPagedTransferJob job;
+        job.src_page_table = d_src_pages;
+        job.dst_page_table = d_dst_pages;
+        job.num_pages = static_cast<int>(page_count);
+        job.layer_begin = 0;
+        job.layer_end = 1;
+        job.src_layer_stride = 0;
+        job.dst_layer_stride = 0;
+        job.src_base_offset = 0;
+        job.dst_base_offset = static_cast<size_t>(ctx.target_offset);
+
+        auto err = cudaMemcpyAsync(d_job, &job, sizeof(job),
+                                   cudaMemcpyHostToDevice,
+                                   comm_state->completion_stream);
+        status = cudaStatus(err, "cudaMemcpyAsync(paged job)");
+        if (status.ok()) work_enqueued = true;
+        if (!status.ok()) break;
+
+        err = tentNcclGinLaunchPagedPut(
+            comm_state->dev_comm, comm_state->peer_rank, lanes,
+            window_state->window, source_window_state->window, layout, d_job,
+            1, 0, comm_state->completion_stream);
+        status = cudaStatus(err, "tentNcclGinLaunchPagedPut");
+        if (status.ok()) work_enqueued = true;
+    }
+
+    if (status.ok()) {
+        auto err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        status = cudaStatus(err, "cudaEventCreateWithFlags(paged sync)");
+    }
+    if (status.ok()) {
+        auto err = cudaEventRecord(event, comm_state->completion_stream);
+        status = cudaStatus(err, "cudaEventRecord(paged sync)");
+    }
+    if (status.ok()) {
+        auto err = cudaEventSynchronize(event);
+        status = cudaStatus(err, "cudaEventSynchronize(paged sync)");
+    } else if (work_enqueued && comm_state) {
+        auto err = cudaStreamSynchronize(comm_state->completion_stream);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "cudaStreamSynchronize(paged cleanup): "
+                         << cudaGetErrorString(err);
+        }
+    }
+
+    if (event) cudaEventDestroy(event);
+    cleanup_device_allocations();
+    if (device_changed) cudaSetDevice(previous_device);
+    return status;
 }
 
 Status NcclTransport::submitTransferTasks(
