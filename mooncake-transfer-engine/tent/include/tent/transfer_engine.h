@@ -329,6 +329,8 @@ class TransferEngine {
     // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
+    Status transferPagedSync(const PagedTransferRequest& request);
+
    private:
     std::unique_ptr<TransferEngineImpl> impl_;
 };

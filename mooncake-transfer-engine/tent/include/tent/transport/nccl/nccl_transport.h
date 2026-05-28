@@ -32,6 +32,7 @@
 #include <nccl_device.h>
 
 #include "tent/common/concurrent/thread_pool.h"
+#include "tent/common/types.h"
 #include "tent/platform/cuda.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
@@ -43,6 +44,7 @@ struct NcclParams {
     size_t max_concurrent_tasks = 4;
     size_t gin_lanes = 4;
     bool wait_ack = false;
+    bool force_gin = false;
 };
 
 struct NcclTask {
@@ -103,6 +105,8 @@ class NcclTransport : public Transport {
 
     Status removeMemoryBuffer(BufferDesc& desc) override;
 
+    Status transferPagedSync(const PagedTransferRequest& request);
+
     const char* getName() const override { return "nccl"; }
 
    private:
@@ -114,6 +118,8 @@ class NcclTransport : public Transport {
     bool isCudaLocation(const std::string& location) const;
     Status markFailed(NcclTask& task, const std::string& reason);
     Status buildTransferContext(const Request& request, TransferContext& ctx);
+    Status buildTransferContext(const Request& request, size_t source_length,
+                                size_t target_length, TransferContext& ctx);
     Status ensureComm(const TransferContext& ctx,
                       std::shared_ptr<CommState>& state);
     Status ensureWindow(const TransferContext& ctx,

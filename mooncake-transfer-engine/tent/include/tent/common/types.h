@@ -100,6 +100,15 @@ struct Request {
     IntentType intent_type = IntentType::INTENT_UNSPEC;
 };
 
+struct PagedTransferRequest {
+    SegmentID target_id = 0;
+    std::vector<void*> src_layer_ptrs;
+    std::vector<uint64_t> dst_layer_ptrs;
+    std::vector<int32_t> src_page_indices;
+    std::vector<int32_t> dst_page_indices;
+    size_t page_bytes = 0;
+};
+
 enum TransferStatusEnum {
     INITIAL,
     PENDING,

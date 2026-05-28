@@ -28,6 +28,8 @@ struct TentNcclPagedKvLayout {
     int num_kv_heads = 0;
     int head_dim = 0;
     int dtype_bytes = 0;
+    int gin_resource_sharing = NCCL_GIN_RESOURCE_SHARING_CTA;
+    uint32_t gin_opt_flags = ncclGinOptFlagsDefault;
 };
 
 struct TentNcclPagedTransferJob {
@@ -38,6 +40,8 @@ struct TentNcclPagedTransferJob {
     int layer_end = 0;
     size_t src_layer_stride = 0;
     size_t dst_layer_stride = 0;
+    size_t src_base_offset = 0;
+    size_t dst_base_offset = 0;
 };
 
 #ifdef __cplusplus

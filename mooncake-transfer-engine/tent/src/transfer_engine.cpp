@@ -178,5 +178,10 @@ Status TransferEngine::progressBatch(BatchID batch_id,
     return impl_->progressBatch(batch_id, overall_status);
 }
 
+Status TransferEngine::transferPagedSync(
+    const PagedTransferRequest& request) {
+    return impl_->transferPagedSync(request);
+}
+
 }  // namespace tent
 }  // namespace mooncake
