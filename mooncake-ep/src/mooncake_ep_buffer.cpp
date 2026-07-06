@@ -34,10 +34,12 @@ static bool macaHostPhaseFenceCoversPeers() {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
+                                   bool use_nccl,
                                    TransferEngine* engine)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
+      use_nccl_(use_nccl),
       comm_stream(at::cuda::getStreamFromPool(true)) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
     // Get ranks
@@ -45,6 +47,31 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
 
+    if (use_nccl_) {
+#ifdef USE_NCCL_DEVICE
+        if (engine) {
+            nccl_transport_ = engine->getOrCreateNcclTransport();
+        } else {
+            owned_nccl_transport_ = device::createNcclDeviceTransport();
+            nccl_transport_ = owned_nccl_transport_.get();
+        }
+        if (!nccl_transport_) {
+            throw std::runtime_error(
+                "[EP] Failed to create NCCL DeviceTransport");
+        }
+        ibgda_disabled_ = true;
+
+        // Bootstrap and symmetric allocation happen after Python broadcasts
+        // the NCCL unique ID.
+        CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
+        CUDA_CHECK(
+            cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+        return;
+#else
+        throw std::runtime_error(
+            "[EP] NCCL backend requested, but USE_NCCL_DEVICE is disabled");
+#endif
+    }
     // P2P transport — owns GDR buffer allocation and IPC handle exchange.
     if (engine) {
         p2p_transport_ = engine->getOrCreateP2pTransport(num_ranks);
@@ -101,7 +128,141 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 }
 
+int MooncakeEpBuffer::get_nccl_unique_id_size() const {
+#ifdef USE_NCCL_DEVICE
+    return static_cast<int>((sizeof(ncclUniqueId) + sizeof(int32_t) - 1) /
+                            sizeof(int32_t));
+#else
+    return 0;
+#endif
+}
+
+std::vector<int32_t> MooncakeEpBuffer::get_nccl_unique_id() {
+#ifdef USE_NCCL_DEVICE
+    if (!use_nccl_ || !nccl_transport_) {
+        throw std::runtime_error("[EP] NCCL DeviceTransport is not enabled");
+    }
+    return nccl_transport_->createUniqueId();
+#else
+    throw std::runtime_error(
+        "[EP] NCCL backend requested, but USE_NCCL_DEVICE is disabled");
+#endif
+}
+
+void MooncakeEpBuffer::initialize_nccl(
+    const std::vector<int32_t>& unique_id, int gin_context_count,
+    int gin_connection_type, bool lsa_multimem) {
+#ifdef USE_NCCL_DEVICE
+    if (!use_nccl_ || !nccl_transport_) {
+        throw std::runtime_error("[EP] NCCL DeviceTransport is not enabled");
+    }
+    if (gdr_buffer || nccl_window_) {
+        throw std::runtime_error(
+            "[EP] NCCL DeviceTransport is already initialized");
+    }
+    if (gin_context_count <= 0 ||
+        gin_connection_type != NCCL_GIN_CONNECTION_FULL) {
+        throw std::invalid_argument(
+            "[EP] NCCL DeviceTransport requires a positive context count and "
+            "full GIN connectivity");
+    }
+
+    device::NcclTransportConfig config;
+    config.rank = rank;
+    config.num_ranks = num_ranks;
+    config.gin_context_count = gin_context_count;
+    config.gin_signal_count = 0;
+    config.gin_connection_type =
+        static_cast<ncclGinConnectionType_t>(gin_connection_type);
+    config.lsa_multimem = lsa_multimem;
+
+    if (nccl_transport_->initialize(config, unique_id) != 0) {
+        throw std::runtime_error(
+            "[EP] Failed to initialize NCCL DeviceTransport");
+    }
+
+    const auto& props = nccl_transport_->properties();
+    if (props.gin_connection_count <= 0 || props.gin_context_count <= 0) {
+        nccl_transport_->shutdown();
+        throw std::runtime_error(
+            "[EP] NCCL DeviceTransport did not provide the GIN resources "
+            "required for non-LSA peers");
+    }
+
+    gdr_buffer = nccl_transport_->allocateBuffer(num_ep_buffer_bytes);
+    if (!gdr_buffer) {
+        nccl_transport_->shutdown();
+        throw std::runtime_error(
+            "[EP] Failed to allocate the NCCL symmetric buffer");
+    }
+    CUDA_CHECK(cudaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
+
+    if (nccl_transport_->registerWindow(gdr_buffer, num_ep_buffer_bytes,
+                                        &nccl_window_) != 0) {
+        nccl_transport_->freeBuffer(gdr_buffer);
+        gdr_buffer = nullptr;
+        nccl_transport_->shutdown();
+        throw std::runtime_error(
+            "[EP] Failed to register the NCCL symmetric window");
+    }
+
+    LOG(INFO) << "[EP] NCCL DeviceTransport initialized: rank=" << props.rank
+              << "/" << props.num_ranks
+              << " gin_type=" << static_cast<int>(props.gin_type)
+              << " gin_connections=" << props.gin_connection_count
+              << " gin_contexts=" << props.gin_context_count;
+#else
+    (void)unique_id;
+    (void)gin_context_count;
+    (void)gin_connection_type;
+    (void)lsa_multimem;
+    throw std::runtime_error(
+        "[EP] NCCL backend requested, but USE_NCCL_DEVICE is disabled");
+#endif
+}
+
+std::tuple<int, int, int, int> MooncakeEpBuffer::get_nccl_properties() const {
+#ifdef USE_NCCL_DEVICE
+    if (!nccl_transport_ || !nccl_transport_->initialized())
+        return {0, 0, 0, 0};
+    const auto& props = nccl_transport_->properties();
+    return {props.runtime_version, static_cast<int>(props.gin_type),
+            props.gin_connection_count, props.gin_context_count};
+#else
+    return {0, 0, 0, 0};
+#endif
+}
+
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
+    if (use_nccl_) {
+#ifdef USE_NCCL_DEVICE
+        cudaError_t sync_status = cudaDeviceSynchronize();
+        if (sync_status != cudaSuccess) {
+            LOG(ERROR)
+                << "[EP] CUDA synchronization before NCCL teardown failed: "
+                << cudaGetErrorString(sync_status);
+        }
+        if (nccl_window_ && nccl_transport_) {
+            if (nccl_transport_->deregisterWindow(nccl_window_) != 0) {
+                LOG(ERROR) << "[EP] Failed to deregister NCCL window";
+            }
+            nccl_window_ = nullptr;
+        }
+        if (gdr_buffer && nccl_transport_) {
+            if (nccl_transport_->freeBuffer(gdr_buffer) != 0) {
+                LOG(ERROR) << "[EP] Failed to free NCCL symmetric buffer";
+            }
+            gdr_buffer = nullptr;
+        }
+        owned_nccl_transport_.reset();
+        nccl_transport_ = nullptr;
+#endif
+        if (workspace) {
+            cudaFree(workspace);
+            workspace = nullptr;
+        }
+        return;
+    }
     // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
     // teardown. When engine owns it, just clear the pointer.
     owned_rdma_transport_.reset();
@@ -160,7 +321,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
+    uint64_t phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
@@ -207,9 +368,18 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     void* rkeys_ptr = rdma_transport_ ? rdma_transport_->rkeysPtr() : nullptr;
     void* qp_devctxs_ptr =
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
-    int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
-    void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
-
+    int32_t* nvlink_avail =
+        p2p_transport_ ? p2p_transport_->availableTablePtr() : nullptr;
+    void** ipc_ptrs =
+        p2p_transport_ ? p2p_transport_->peerPtrsTablePtr() : nullptr;
+#ifdef USE_NCCL_DEVICE
+    device::NcclDeviceContext nccl_context{};
+    ncclWindow_t nccl_window = nullptr;
+    if (use_nccl_) {
+        nccl_context = nccl_transport_->deviceContext();
+        nccl_window = nccl_window_;
+    }
+#endif
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
@@ -242,12 +412,17 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             packed_recv_count.data_ptr<int>(), active_ranks.data_ptr<int32_t>(),
             gdr_buffer, buffer.rdma_send_signal_buffer,
             buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
-            buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs_ptr,
-            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x.data_ptr(),
+            buffer.rdma_recv_data_buffer, buffer.nccl_completion_buffer,
+            nullptr, nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr,
+            nvlink_avail, ipc_ptrs,
+#ifdef USE_NCCL_DEVICE
+            nccl_context, nccl_window,
+#endif
+            x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases);
+            timeout_ticks, phase_epoch, phases);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -336,7 +511,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
+    uint64_t phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
@@ -365,8 +540,18 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     void* rkeys_ptr = rdma_transport_ ? rdma_transport_->rkeysPtr() : nullptr;
     void* qp_devctxs_ptr =
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
-    int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
-    void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    int32_t* nvlink_avail =
+        p2p_transport_ ? p2p_transport_->availableTablePtr() : nullptr;
+    void** ipc_ptrs =
+        p2p_transport_ ? p2p_transport_->peerPtrsTablePtr() : nullptr;
+#ifdef USE_NCCL_DEVICE
+    device::NcclDeviceContext nccl_context{};
+    ncclWindow_t nccl_window = nullptr;
+    if (use_nccl_) {
+        nccl_context = nccl_transport_->deviceContext();
+        nccl_window = nccl_window_;
+    }
+#endif
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
@@ -397,14 +582,19 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         mooncake::combine(
             combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
-            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
-            nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail,
-            ipc_ptrs, x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer,
+            buffer.nccl_completion_buffer, nullptr, nullptr, raddrs_ptr,
+            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs,
+#ifdef USE_NCCL_DEVICE
+            nccl_context, nccl_window,
+#endif
+            x.data_ptr(), topk_idx.data_ptr<int64_t>(),
             topk_weights.data_ptr<float>(), src_info.data_ptr<int>(),
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
+            num_ranks, workspace, launch_stream, timeout_ticks, phase_epoch,
+            phases,
             zero_copy);
     };
     if (return_recv_hook) {

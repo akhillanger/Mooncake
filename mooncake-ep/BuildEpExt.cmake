@@ -12,6 +12,8 @@
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
 #   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 #   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
+#   EP_USE_NCCL_DEVICE  - set to "1" for the NCCL DeviceTransport backend
+#   NCCL_ROOT           - NCCL installation containing nccl_device.h
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -50,6 +52,14 @@ if(EP_USE_MACA)
   endif()
 else()
   unset(ENV{MOONCAKE_EP_USE_MACA})
+endif()
+if(EP_USE_NCCL_DEVICE)
+  set(ENV{MOONCAKE_EP_USE_NCCL_DEVICE} "1")
+  if(NCCL_ROOT)
+    set(ENV{NCCL_ROOT} "${NCCL_ROOT}")
+  endif()
+else()
+  unset(ENV{MOONCAKE_EP_USE_NCCL_DEVICE})
 endif()
 
 # ---------------------------------------------------------------------------

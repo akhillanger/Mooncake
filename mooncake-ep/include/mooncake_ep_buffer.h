@@ -22,6 +22,7 @@ class TransferEngine;
 struct BufferLayout {
     int* rdma_send_signal_buffer;
     int* rdma_recv_signal_buffer;
+    uint64_t* nccl_completion_buffer;
     void* rdma_send_data_buffer;
     void* rdma_recv_data_buffer;
 };
@@ -40,25 +41,34 @@ struct BufferPair {
     BufferPair(void* rdma_buffer, int num_max_dispatch_tokens_per_rank,
                int hidden, int num_ranks, int num_experts) {
         size_t signaling_buffer_bytes = num_experts * sizeof(int);
+        size_t completion_buffer_bytes = num_experts * sizeof(uint64_t);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
             (2 * sizeof(int4) + hidden * EP_BF16_SIZE);
+        size_t per_buffer_bytes = 2 * signaling_buffer_bytes +
+                                  completion_buffer_bytes +
+                                  2 * send_recv_buffer_bytes;
         for (int i = 0; i < 2; ++i) {
-            size_t rdma_base_offset = total_bytes +
-                                      2 * i * signaling_buffer_bytes +
-                                      2 * i * send_recv_buffer_bytes;
+            size_t rdma_base_offset = i * per_buffer_bytes;
             buffers[i] = {
                 advance<int*>(rdma_buffer, rdma_base_offset),
                 advance<int*>(rdma_buffer,
                               rdma_base_offset + signaling_buffer_bytes),
-                advance<int*>(rdma_buffer,
-                              rdma_base_offset + 2 * signaling_buffer_bytes),
-                advance<int*>(rdma_buffer, rdma_base_offset +
-                                               2 * signaling_buffer_bytes +
-                                               send_recv_buffer_bytes),
+                advance<uint64_t*>(
+                    rdma_buffer,
+                    rdma_base_offset + 2 * signaling_buffer_bytes),
+                advance<int*>(
+                    rdma_buffer, rdma_base_offset +
+                                     2 * signaling_buffer_bytes +
+                                     completion_buffer_bytes),
+                advance<int*>(
+                    rdma_buffer, rdma_base_offset +
+                                     2 * signaling_buffer_bytes +
+                                     completion_buffer_bytes +
+                                     send_recv_buffer_bytes),
             };
         }
-        total_bytes += 4 * signaling_buffer_bytes + 4 * send_recv_buffer_bytes;
+        total_bytes = 2 * per_buffer_bytes;
     }
 };
 
@@ -69,24 +79,33 @@ struct MooncakeEpBuffer {
     int rank, num_ranks;
     int clock_rate_khz;
 
-    // GDR buffer — owned by p2p_transport_
+    // Symmetric communication buffer owned by the selected device transport.
     int buffer_idx{};
-    int phase_epochs[2]{};
+    uint64_t phase_epochs[2]{};
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
     // Device transports — own all platform-specific state.
     // p2p_transport_: NVLink intra-node P2P.
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
+    // nccl_transport_: NCCL LSA/GIN. nullptr unless explicitly selected.
     device::P2pTransport* p2p_transport_ = nullptr;
     device::RdmaTransport* rdma_transport_ = nullptr;
+#ifdef USE_NCCL_DEVICE
+    device::NcclTransport* nccl_transport_ = nullptr;
+    ncclWindow_t nccl_window_ = nullptr;
+#endif
     // When EP creates transports itself (no engine provided), ownership lives
     // in these unique_ptrs.  When an engine is provided, the engine owns them
     // and these remain null.
     std::unique_ptr<device::P2pTransport> owned_p2p_transport_;
     std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
+#ifdef USE_NCCL_DEVICE
+    std::unique_ptr<device::NcclTransport> owned_nccl_transport_;
+#endif
 
     bool ibgda_disabled_ = false;
+    bool use_nccl_ = false;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
 
@@ -101,7 +120,10 @@ struct MooncakeEpBuffer {
     // (engine owns the transports).  Otherwise EP creates its own via the
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     TransferEngine* engine = nullptr);
+                     TransferEngine* engine = nullptr)
+        : MooncakeEpBuffer(rank, num_ranks, num_ep_buffer_bytes, false, engine) {}
+    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
+                     bool use_nccl, TransferEngine* engine = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
 
@@ -126,13 +148,22 @@ struct MooncakeEpBuffer {
                                           int hidden, int num_experts);
 
     bool ibgda_disabled() const { return ibgda_disabled_; }
+    bool nccl_enabled() const { return use_nccl_; }
 
     bool is_roce() const {
         return rdma_transport_ && rdma_transport_->isRoce();
     }
 
+    int get_nccl_unique_id_size() const;
+    std::vector<int32_t> get_nccl_unique_id();
+    void initialize_nccl(const std::vector<int32_t>& unique_id,
+                         int gin_context_count, int gin_connection_type,
+                         bool lsa_multimem);
+    std::tuple<int, int, int, int> get_nccl_properties() const;
+
     // Fast-path: IBGDA available, or all peers accessible via P2P.
     bool use_fast_path() {
+        if (use_nccl_) return gdr_buffer != nullptr;
         if (!ibgda_disabled_) return true;
         bool p2p_all = p2p_transport_ && p2p_transport_->allPeersAccessible();
         if (!p2p_all) {

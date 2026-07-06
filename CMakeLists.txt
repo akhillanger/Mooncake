@@ -149,6 +149,8 @@ if (WITH_EP)
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
+        "-DEP_USE_NCCL_DEVICE=$<IF:$<BOOL:${USE_NCCL_DEVICE}>,1,0>"
+        "-DNCCL_ROOT=${NCCL_ROOT}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
       COMMENT "Building Mooncake EP Python extension(s)"
       DEPENDS engine

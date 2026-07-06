@@ -22,8 +22,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t>())
+        .def(py::init<int, int, int64_t, bool>(), py::arg("rank"),
+             py::arg("num_ranks"), py::arg("num_ep_buffer_bytes"),
+             py::arg("use_nccl") = false)
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
+        .def("nccl_enabled", &MooncakeEpBuffer::nccl_enabled)
+        .def("get_nccl_unique_id_size",
+             &MooncakeEpBuffer::get_nccl_unique_id_size)
+        .def("get_nccl_unique_id", &MooncakeEpBuffer::get_nccl_unique_id)
+        .def("initialize_nccl", &MooncakeEpBuffer::initialize_nccl)
+        .def("get_nccl_properties", &MooncakeEpBuffer::get_nccl_properties)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
         .def("update_local_qpns", &MooncakeEpBuffer::update_local_qpns)
         .def("is_roce", &MooncakeEpBuffer::is_roce)

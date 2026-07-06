@@ -9,6 +9,14 @@ use_maca = (
     os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
     or (hasattr(torch.version, "maca") and torch.version.maca is not None)
 )
+use_nccl = os.getenv("MOONCAKE_EP_USE_NCCL_DEVICE", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+}
+if use_nccl and (use_musa or use_maca):
+    raise RuntimeError("NCCL DeviceTransport is only supported on CUDA")
 if use_musa:
     try:
         import torchada  # noqa: F401
@@ -51,7 +59,8 @@ sysroot_library_dirs = existing_dirs(
 )
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
-cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
+glog_define = "-DGLOG_USE_GLOG_EXPORT"
+cxx_args = [abi_define, glog_define, "-std=c++20", "-O3", "-g0"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
@@ -96,6 +105,46 @@ else:
         "-Xcompiler",
         "-g0",
     ]
+    if use_nccl:
+        nccl_root = os.getenv("NCCL_ROOT", "/usr/local/cuda")
+        nccl_include_dir = next(
+            (
+                path
+                for path in (
+                    os.path.join(nccl_root, "include"),
+                    os.path.join(nccl_root, "build", "include"),
+                )
+                if os.path.isfile(os.path.join(path, "nccl_device.h"))
+            ),
+            None,
+        )
+        nccl_library_dir = next(
+            (
+                path
+                for path in (
+                    os.path.join(nccl_root, "lib"),
+                    os.path.join(nccl_root, "lib64"),
+                    os.path.join(nccl_root, "build", "lib"),
+                    os.path.join(nccl_root, "build", "lib64"),
+                )
+                if os.path.isfile(os.path.join(path, "libnccl.so"))
+            ),
+            None,
+        )
+        if nccl_include_dir is None or nccl_library_dir is None:
+            raise RuntimeError(
+                "MOONCAKE_EP_USE_NCCL_DEVICE requires NCCL_ROOT with "
+                "nccl_device.h and libnccl.so"
+            )
+        nccl_defines = [
+            "-DUSE_NCCL_DEVICE",
+            "-DNCCL_DEVICE_PERMIT_EXPERIMENTAL_CODE=1",
+        ]
+        include_dirs.append(nccl_include_dir)
+        cuda_library_dirs.append(nccl_library_dir)
+        cuda_libraries.append("nccl")
+        cxx_args += nccl_defines
+        device_args += nccl_defines
     # Link against the CUDA driver stub library if available.
     if CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")

@@ -89,14 +89,20 @@ class Buffer:
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
-        # NIC auto-detection happens inside ep.Buffer via Topology::discover().
+        transport = os.getenv("MOONCAKE_EP_DEVICE_TRANSPORT", "auto").lower()
+        if transport not in {"auto", "nccl"}:
+            raise ValueError(f"Unsupported Mooncake EP transport: {transport}")
+        self._use_nccl = transport == "nccl"
+        # NCCL mode defers symmetric allocation until connect() broadcasts the ID.
         self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes
+            self.rank, self.group_size, num_ep_buffer_bytes, self._use_nccl
         )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
-        self._use_fallback = bool(self.runtime.ibgda_disabled())
+        self._use_fallback = (
+            False if self._use_nccl else bool(self.runtime.ibgda_disabled())
+        )
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
         self._maca_phase_token: Optional[torch.Tensor] = None
         self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
@@ -167,8 +173,70 @@ class Buffer:
 
         return wrapped_hook
 
+    def _connect_nccl(self) -> None:
+        if self.runtime.nccl_enabled() is not True:
+            raise RuntimeError("Mooncake EP extension was not built with NCCL support")
+
+        unique_id_words = int(self.runtime.get_nccl_unique_id_size())
+        if unique_id_words <= 0:
+            raise RuntimeError("Invalid NCCL unique ID size")
+
+        if self.rank == 0:
+            unique_id_values = self.runtime.get_nccl_unique_id()
+            if len(unique_id_values) != unique_id_words:
+                raise RuntimeError("NCCL unique ID size mismatch")
+        else:
+            unique_id_values = [0] * unique_id_words
+
+        backend = dist.get_backend(self.group)
+        control_device = "cpu" if backend == "gloo" else "cuda"
+        unique_id = torch.tensor(
+            unique_id_values, dtype=torch.int32, device=control_device
+        )
+        source = dist.get_global_rank(self.group, 0)
+        dist.broadcast(unique_id, src=source, group=self.group)
+
+        gin_contexts = int(os.getenv("MOONCAKE_EP_NCCL_GIN_CONTEXTS", "4"))
+        if gin_contexts <= 0:
+            raise ValueError("MOONCAKE_EP_NCCL_GIN_CONTEXTS must be positive")
+
+        connection_name = os.getenv(
+            "MOONCAKE_EP_NCCL_GIN_CONNECTION", "full"
+        ).lower()
+        connection_types = {"full": 1}
+        if connection_name not in connection_types:
+            raise ValueError(
+                "MOONCAKE_EP_NCCL_GIN_CONNECTION must be full"
+            )
+
+        self.runtime.initialize_nccl(
+            unique_id.tolist(),
+            gin_contexts,
+            connection_types[connection_name],
+            _env_enabled("MOONCAKE_EP_NCCL_LSA_MULTIMEM"),
+        )
+        dist.barrier(group=self.group)
+        runtime_version, gin_type, connection_count, context_count = (
+            self.runtime.get_nccl_properties()
+        )
+        self._nccl_properties = {
+            "runtime_version": runtime_version,
+            "gin_type": gin_type,
+            "gin_connection_count": connection_count,
+            "gin_context_count": context_count,
+        }
+        self._use_fallback = False
+
     def connect(self, is_update: bool = False):
         from mooncake import ep
+
+        if self._use_nccl:
+            if is_update:
+                raise RuntimeError(
+                    "NCCL EP communicators do not support membership updates"
+                )
+            self._connect_nccl()
+            return
 
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()

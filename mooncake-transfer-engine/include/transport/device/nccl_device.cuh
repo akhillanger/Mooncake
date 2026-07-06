@@ -71,6 +71,18 @@ __device__ __forceinline__ void mc_nccl_gin_put_signal(
             ncclGin_None{}, ncclCoopThread{});
 }
 
+__device__ __forceinline__ void mc_nccl_gin_put_va_signal(
+    const NcclDeviceContext& ctx, int context_index, int peer,
+    ncclWindow_t dst_window, size_t dst_offset, ncclWindow_t src_window,
+    size_t src_offset, size_t bytes, ncclWindow_t signal_window,
+    size_t signal_offset) {
+    ncclGin gin(ctx.comm, context_index);
+    gin.put(ncclTeamWorld(ctx.comm), peer, dst_window, dst_offset, src_window,
+            src_offset, bytes,
+            ncclGin_StrongVASignalInc{signal_window, signal_offset},
+            ncclGin_None{}, ncclCoopThread{});
+}
+
 __device__ __forceinline__ void mc_nccl_gin_signal(
     const NcclDeviceContext& ctx, int context_index, int peer,
     ncclGinSignal_t signal_index) {
@@ -90,6 +102,13 @@ __device__ __forceinline__ void mc_nccl_gin_wait_signal(
     ncclGinSignal_t signal_index, uint64_t value) {
     ncclGin gin(ctx.comm, context_index);
     gin.waitSignal(ncclCoopThread{}, signal_index, value);
+}
+
+__device__ __forceinline__ uint64_t mc_nccl_gin_read_va_signal(
+    const NcclDeviceContext& ctx, int context_index, ncclWindow_t window,
+    size_t offset) {
+    ncclGin gin(ctx.comm, context_index);
+    return gin.readSignal(window, offset);
 }
 
 }  // namespace device
