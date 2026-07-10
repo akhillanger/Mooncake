@@ -31,7 +31,7 @@ MemoryBackendType ProbeAllocatorBackend(int device_id) {
     int fabric_attr = 0;
     res = cuDeviceGetAttribute(
         &fabric_attr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
-    if (res != CUDA_SUCCESS || !fabric_attr) {
+    if (res != CUDA_SUCCESS) {
         return MemoryBackendType::use_cudamalloc;
     }
 
@@ -39,12 +39,21 @@ MemoryBackendType ProbeAllocatorBackend(int device_id) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = dev;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    prop.requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR |
+        (fabric_attr ? CU_MEM_HANDLE_TYPE_FABRIC : 0));
+
+    size_t granularity = 0;
+    res = cuMemGetAllocationGranularity(&granularity, &prop,
+                                        CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+    if (res != CUDA_SUCCESS) {
+        return MemoryBackendType::use_cudamalloc;
+    }
 
     CUmemGenericAllocationHandle handle;
-    size_t size = 4096;
+    size_t size = granularity;
 
-    res = cuMemCreate(&handle, size, &prop, 0);
+    res = cuMemCreateTryFabric(&handle, size, &prop, 0);
     if (res == CUDA_SUCCESS) {
         cuMemRelease(handle);
         return MemoryBackendType::use_cumemcreate;
@@ -77,9 +86,9 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         std::cerr << "cuDeviceGetAttribute (fabric) failed: " << result << "\n";
         return nullptr;
     }
-    if (fabric_supported) {
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-    }
+    prop.requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR |
+        (fabric_supported ? CU_MEM_HANDLE_TYPE_FABRIC : 0));
 
     result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
@@ -90,7 +99,7 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
     }
     if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
     result = cuMemGetAllocationGranularity(&granularity, &prop,
-                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+                                           CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemGetAllocationGranularity failed: " << result;
         return nullptr;

@@ -90,6 +90,14 @@ struct NcclWindowDesc {
                                    allocate_local, reply_msg);
 };
 
+struct NcclWindowBatchDesc {
+    std::vector<NcclWindowDesc> windows;
+    std::string reply_msg;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclWindowBatchDesc, windows, reply_msg);
+};
+
 struct NcclSignalDesc {
     std::string session_key;
     int peer = 0;
@@ -122,6 +130,9 @@ using OnReceiveNcclBootstrap = std::function<int(
 using OnReceiveNcclWindow =
     std::function<int(const NcclWindowDesc& request, NcclWindowDesc& response)>;
 
+using OnReceiveNcclWindowBatch = std::function<int(
+    const NcclWindowBatchDesc& request, NcclWindowBatchDesc& response)>;
+
 using OnReceiveNcclSignal =
     std::function<int(const NcclSignalDesc& request, NcclSignalDesc& response)>;
 
@@ -148,6 +159,18 @@ class ControlClient {
     static Status registerNcclWindow(const std::string& server_addr,
                                      const NcclWindowDesc& request,
                                      NcclWindowDesc& response);
+
+    static Status deregisterNcclWindow(const std::string& server_addr,
+                                       const NcclWindowDesc& request,
+                                       NcclWindowDesc& response);
+
+    static Status registerNcclWindowBatch(
+        const std::string& server_addr, const NcclWindowBatchDesc& request,
+        NcclWindowBatchDesc& response);
+
+    static Status deregisterNcclWindowBatch(
+        const std::string& server_addr, const NcclWindowBatchDesc& request,
+        NcclWindowBatchDesc& response);
 
     static Status waitNcclSignal(const std::string& server_addr,
                                  const NcclSignalDesc& request,
@@ -216,6 +239,21 @@ class ControlService {
         nccl_window_callback_ = callback;
     }
 
+    void setNcclWindowDeregisterCallback(
+        const OnReceiveNcclWindow& callback) {
+        nccl_window_deregister_callback_ = callback;
+    }
+
+    void setNcclWindowBatchCallback(
+        const OnReceiveNcclWindowBatch& callback) {
+        nccl_window_batch_callback_ = callback;
+    }
+
+    void setNcclWindowBatchDeregisterCallback(
+        const OnReceiveNcclWindowBatch& callback) {
+        nccl_window_batch_deregister_callback_ = callback;
+    }
+
     void setNcclSignalCallback(const OnReceiveNcclSignal& callback) {
         nccl_signal_callback_ = callback;
     }
@@ -238,6 +276,15 @@ class ControlService {
 
     void onRegisterNcclWindow(const std::string_view& request,
                               std::string& response);
+
+    void onDeregisterNcclWindow(const std::string_view& request,
+                                std::string& response);
+
+    void onRegisterNcclWindowBatch(const std::string_view& request,
+                                   std::string& response);
+
+    void onDeregisterNcclWindowBatch(const std::string_view& request,
+                                     std::string& response);
 
     void onWaitNcclSignal(const std::string_view& request,
                           std::string& response);
@@ -271,6 +318,9 @@ class ControlService {
     OnReceiveBootstrap bootstrap_callback_;
     OnReceiveNcclBootstrap nccl_bootstrap_callback_;
     OnReceiveNcclWindow nccl_window_callback_;
+    OnReceiveNcclWindow nccl_window_deregister_callback_;
+    OnReceiveNcclWindowBatch nccl_window_batch_callback_;
+    OnReceiveNcclWindowBatch nccl_window_batch_deregister_callback_;
     OnReceiveNcclSignal nccl_signal_callback_;
     OnNotify notify_callback_;
     TransferEngineImpl* impl_;

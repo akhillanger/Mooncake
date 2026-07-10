@@ -33,6 +33,9 @@
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
+#ifdef USE_NCCL
+#include "tent/transport/nccl/nccl_transport.h"
+#endif
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
@@ -1522,6 +1525,27 @@ Status TransferEngineImpl::transferSync(
     }
     CHECK_STATUS(freeBatch(batch_id));
     return Status::OK();
+}
+
+Status TransferEngineImpl::transferPagedSync(
+    const PagedTransferRequest& request) {
+#ifdef USE_NCCL
+    auto& transport = transport_list_[NCCL];
+    if (!transport) {
+        return Status::NotImplemented(
+            "NCCL transport is not available for paged transfer" LOC_MARK);
+    }
+    auto* nccl = dynamic_cast<NcclTransport*>(transport.get());
+    if (!nccl) {
+        return Status::InternalError(
+            "NCCL transport slot has unexpected implementation" LOC_MARK);
+    }
+    return nccl->transferPagedSync(request);
+#else
+    (void)request;
+    return Status::NotImplemented(
+        "NCCL paged transfer requires USE_NCCL" LOC_MARK);
+#endif
 }
 
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
