@@ -50,6 +50,9 @@ enum RpcFuncID {
     BootstrapNccl,
     RegisterNcclWindow,
     WaitNcclSignal,
+    DeregisterNcclWindow,
+    RegisterNcclWindowBatch,
+    DeregisterNcclWindowBatch,
 };
 
 class ClientPool;

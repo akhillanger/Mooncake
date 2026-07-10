@@ -35,6 +35,10 @@ extern "C" cudaError_t tentNcclGinLaunchPut(
     size_t dst_offset, ncclWindow_t src_window, size_t src_offset,
     size_t total_bytes, unsigned long long signal_value, cudaStream_t stream);
 
+extern "C" cudaError_t tentNcclGinLaunchWaitAck(
+    ncclDevComm_t dev_comm, int peer, int lanes,
+    unsigned long long signal_value, cudaStream_t stream);
+
 namespace {
 
 #define CHECK_CUDA(call)                                                     \
@@ -70,10 +74,16 @@ struct Options {
     int dtype_bytes = 2;
     int warmup = 5;
     int iters = 20;
+    int window_offset_bytes = 0;
+    int page_padding_bytes = 0;
     int gin_resource_sharing = NCCL_GIN_RESOURCE_SHARING_CTA;
     int gin_opt_flags = ncclGinOptFlagsDefault;
     bool validate = true;
+    bool with_ack = false;
     bool baseline = true;
+    bool split_jobs = false;
+    bool identity_map = false;
+    bool check_option_guard = false;
 };
 
 struct WindowPair {
@@ -97,6 +107,10 @@ struct BenchState {
     void* dst_pool = nullptr;
     void* src_staging = nullptr;
     void* dst_staging = nullptr;
+    size_t src_pool_window_offset = 0;
+    size_t dst_pool_window_offset = 0;
+    size_t src_staging_window_offset = 0;
+    size_t dst_staging_window_offset = 0;
     int32_t* src_table0 = nullptr;
     int32_t* dst_table0 = nullptr;
     int32_t* src_table1 = nullptr;
@@ -105,11 +119,14 @@ struct BenchState {
     TentNcclPagedTransferJob* job1 = nullptr;
     uint64_t* errors1 = nullptr;
     size_t page_bytes = 0;
+    size_t page_stride_bytes = 0;
     size_t page_words = 0;
     size_t layer_stride_bytes = 0;
     size_t pool_bytes = 0;
     size_t staging_bytes = 0;
     unsigned long long next_signal = 1;
+    unsigned long long ack_signal_count = 0;
+    int fused_job_count = 1;
 };
 
 bool parseIntValue(const char* arg, const char* key, int& value) {
@@ -134,8 +151,11 @@ void usage(const char* argv0) {
         << "  --layers=N --pages=N --physical-pages=N\n"
         << "  --page-size=N --kv-heads=N --head-dim=N --dtype-bytes=N\n"
         << "  --warmup=N --iters=N\n"
+        << "  --page-padding-bytes=N --window-offset-bytes=N\n"
         << "  --gin-sharing=N (0=gpu, 1=cta, 2=thread)\n"
         << "  --aggregate-requests --skip-credit-check\n"
+        << "  --check-option-guard\n"
+        << "  --split-jobs --identity-map --with-ack\n"
         << "  --no-validate --no-baseline\n";
 }
 
@@ -150,6 +170,14 @@ Options parseOptions(int argc, char** argv) {
             opts.validate = false;
         } else if (std::strcmp(arg, "--no-baseline") == 0) {
             opts.baseline = false;
+        } else if (std::strcmp(arg, "--check-option-guard") == 0) {
+            opts.check_option_guard = true;
+        } else if (std::strcmp(arg, "--split-jobs") == 0) {
+            opts.split_jobs = true;
+        } else if (std::strcmp(arg, "--with-ack") == 0) {
+            opts.with_ack = true;
+        } else if (std::strcmp(arg, "--identity-map") == 0) {
+            opts.identity_map = true;
         } else if (std::strcmp(arg, "--aggregate-requests") == 0) {
             opts.gin_opt_flags |= ncclGinOptFlagsAggregateRequests;
         } else if (std::strcmp(arg, "--skip-credit-check") == 0) {
@@ -167,6 +195,10 @@ Options parseOptions(int argc, char** argv) {
                    parseIntValue(arg, "--gin-sharing",
                                  opts.gin_resource_sharing) ||
                    parseIntValue(arg, "--warmup", opts.warmup) ||
+                   parseIntValue(arg, "--page-padding-bytes",
+                                 opts.page_padding_bytes) ||
+                   parseIntValue(arg, "--window-offset-bytes",
+                                 opts.window_offset_bytes) ||
                    parseIntValue(arg, "--iters", opts.iters)) {
             continue;
         } else {
@@ -196,8 +228,20 @@ void validateOptions(const Options& opts) {
     if (opts.lanes <= 0 || opts.layers <= 0 || opts.pages <= 0 ||
         opts.physical_pages < opts.pages || opts.page_size_tokens <= 0 ||
         opts.num_kv_heads <= 0 || opts.head_dim <= 0 || opts.dtype_bytes <= 0 ||
-        opts.warmup < 0 || opts.iters <= 0) {
+        opts.warmup < 0 || opts.iters <= 0 ||
+        opts.page_padding_bytes < 0 ||
+        opts.window_offset_bytes < 0) {
         std::cerr << "Invalid non-positive benchmark option" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    if (opts.window_offset_bytes % sizeof(uint32_t) != 0) {
+        std::cerr << "--window-offset-bytes must preserve uint32 alignment"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    if (opts.page_padding_bytes % sizeof(uint32_t) != 0) {
+        std::cerr << "--page-padding-bytes must preserve uint32 alignment"
+                  << std::endl;
         std::exit(EXIT_FAILURE);
     }
     if (opts.gin_resource_sharing < NCCL_GIN_RESOURCE_SHARING_GPU ||
@@ -248,7 +292,8 @@ __global__ void gatherKernel(const uint32_t* src_pool, uint32_t* staging,
         const uint64_t src_offset_words =
             (static_cast<uint64_t>(layer) * job.src_layer_stride) /
                 sizeof(uint32_t) +
-            static_cast<uint64_t>(src_page) * page_words;
+            static_cast<uint64_t>(src_page) *
+                (job.src_page_stride_bytes / sizeof(uint32_t));
         const uint64_t dst_offset_words = item * page_words;
         for (uint64_t word = threadIdx.x; word < page_words;
              word += blockDim.x) {
@@ -273,7 +318,8 @@ __global__ void scatterKernel(const uint32_t* staging, uint32_t* dst_pool,
         const uint64_t dst_offset_words =
             (static_cast<uint64_t>(layer) * job.dst_layer_stride) /
                 sizeof(uint32_t) +
-            static_cast<uint64_t>(dst_page) * page_words;
+            static_cast<uint64_t>(dst_page) *
+                (job.dst_page_stride_bytes / sizeof(uint32_t));
         for (uint64_t word = threadIdx.x; word < page_words;
              word += blockDim.x) {
             dst_pool[dst_offset_words + word] = staging[src_offset_words + word];
@@ -298,13 +344,21 @@ __global__ void verifyKernel(const uint32_t* dst_pool,
         const uint64_t dst_offset_words =
             (static_cast<uint64_t>(layer) * job.dst_layer_stride) /
                 sizeof(uint32_t) +
-            static_cast<uint64_t>(dst_page) * page_words;
+            static_cast<uint64_t>(dst_page) *
+                (job.dst_page_stride_bytes / sizeof(uint32_t));
         for (uint64_t word = threadIdx.x; word < page_words;
              word += blockDim.x) {
             const uint32_t expected =
                 expectedWord(layer, static_cast<uint64_t>(src_page), word);
             const uint32_t got = dst_pool[dst_offset_words + word];
             if (got != expected) atomicAdd(errors, 1ull);
+        }
+        const uint64_t dst_page_stride_words =
+            job.dst_page_stride_bytes / sizeof(uint32_t);
+        for (uint64_t word = page_words + threadIdx.x;
+             word < dst_page_stride_words; word += blockDim.x) {
+            if (dst_pool[dst_offset_words + word] != 0)
+                atomicAdd(errors, 1ull);
         }
     }
 }
@@ -313,11 +367,22 @@ int copyGrid(uint64_t work_items) {
     return static_cast<int>(std::min<uint64_t>(work_items, 65535));
 }
 
-void* ncclAllocOn(int device, size_t bytes) {
+void* ncclAllocOn(int device, size_t bytes, size_t offset_bytes) {
     CHECK_CUDA(cudaSetDevice(device));
     void* ptr = nullptr;
-    CHECK_NCCL(ncclMemAlloc(&ptr, bytes));
-    return ptr;
+    CHECK_NCCL(ncclMemAlloc(&ptr, bytes + offset_bytes));
+    return static_cast<void*>(static_cast<char*>(ptr) + offset_bytes);
+}
+
+size_t requiredWindowOffset(const void* ptr) {
+    constexpr uintptr_t kAlignment = NCCL_WIN_REQUIRED_ALIGNMENT;
+    static_assert((kAlignment & (kAlignment - 1)) == 0);
+    return reinterpret_cast<uintptr_t>(ptr) & (kAlignment - 1);
+}
+
+void* requiredWindowBase(void* ptr) {
+    return static_cast<void*>(static_cast<char*>(ptr) -
+                              requiredWindowOffset(ptr));
 }
 
 void cudaMallocOn(int device, void** ptr, size_t bytes) {
@@ -388,12 +453,18 @@ void createDevComms(BenchState& state) {
 WindowPair registerWindowPair(const BenchState& state, void* rank0_ptr,
                               void* rank1_ptr, size_t bytes) {
     WindowPair pair;
+    const size_t rank0_offset = requiredWindowOffset(rank0_ptr);
+    const size_t rank1_offset = requiredWindowOffset(rank1_ptr);
     CHECK_NCCL(ncclGroupStart());
     CHECK_CUDA(cudaSetDevice(state.opts.device0));
-    CHECK_NCCL(ncclCommWindowRegister(state.comm0, rank0_ptr, bytes,
+    CHECK_NCCL(ncclCommWindowRegister(state.comm0,
+                                      requiredWindowBase(rank0_ptr),
+                                      bytes + rank0_offset,
                                       &pair.rank0, NCCL_WIN_COLL_SYMMETRIC));
     CHECK_CUDA(cudaSetDevice(state.opts.device1));
-    CHECK_NCCL(ncclCommWindowRegister(state.comm1, rank1_ptr, bytes,
+    CHECK_NCCL(ncclCommWindowRegister(state.comm1,
+                                      requiredWindowBase(rank1_ptr),
+                                      bytes + rank1_offset,
                                       &pair.rank1, NCCL_WIN_COLL_SYMMETRIC));
     CHECK_NCCL(ncclGroupEnd());
     return pair;
@@ -422,7 +493,8 @@ void copyPageTables(BenchState& state) {
     std::vector<int32_t> dst_table(state.opts.pages);
     for (int i = 0; i < state.opts.pages; ++i) {
         src_table[i] = i;
-        dst_table[i] = state.opts.physical_pages - 1 - i;
+        dst_table[i] = state.opts.identity_map
+                           ? i : state.opts.physical_pages - 1 - i;
     }
 
     const size_t table_bytes = src_table.size() * sizeof(int32_t);
@@ -449,7 +521,7 @@ void copyPageTables(BenchState& state) {
 
 TentNcclPagedTransferJob makeJob(int32_t* src_table, int32_t* dst_table,
                                  const BenchState& state) {
-    TentNcclPagedTransferJob job;
+    TentNcclPagedTransferJob job{};
     job.src_page_table = src_table;
     job.dst_page_table = dst_table;
     job.num_pages = state.opts.pages;
@@ -457,6 +529,11 @@ TentNcclPagedTransferJob makeJob(int32_t* src_table, int32_t* dst_table,
     job.layer_end = state.opts.layers;
     job.src_layer_stride = state.layer_stride_bytes;
     job.dst_layer_stride = state.layer_stride_bytes;
+    job.src_base_offset = state.src_pool_window_offset;
+    job.dst_base_offset = state.dst_pool_window_offset;
+    job.page_bytes = state.page_bytes;
+    job.src_page_stride_bytes = state.page_stride_bytes;
+    job.dst_page_stride_bytes = state.page_stride_bytes;
     return job;
 }
 
@@ -466,15 +543,25 @@ void copyJobs(BenchState& state) {
     TentNcclPagedTransferJob job1 =
         makeJob(state.src_table1, state.dst_table1, state);
     state.job_host = job0;
+    state.fused_job_count = state.opts.split_jobs ? state.opts.layers : 1;
+    std::vector<TentNcclPagedTransferJob> jobs0(state.fused_job_count, job0);
+    std::vector<TentNcclPagedTransferJob> jobs1(state.fused_job_count, job1);
+    if (state.opts.split_jobs) {
+        for (int i = 0; i < state.fused_job_count; ++i) {
+            jobs0[i].layer_begin = jobs1[i].layer_begin = i;
+            jobs0[i].layer_end = jobs1[i].layer_end = i + 1;
+        }
+    }
+    const size_t jobs_bytes = jobs0.size() * sizeof(jobs0.front());
     cudaMallocOn(state.opts.device0, reinterpret_cast<void**>(&state.job0),
-                 sizeof(job0));
+                 jobs_bytes);
     cudaMallocOn(state.opts.device1, reinterpret_cast<void**>(&state.job1),
-                 sizeof(job1));
+                 jobs_bytes);
     CHECK_CUDA(cudaSetDevice(state.opts.device0));
-    CHECK_CUDA(cudaMemcpy(state.job0, &job0, sizeof(job0),
+    CHECK_CUDA(cudaMemcpy(state.job0, jobs0.data(), jobs_bytes,
                           cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaSetDevice(state.opts.device1));
-    CHECK_CUDA(cudaMemcpy(state.job1, &job1, sizeof(job1),
+    CHECK_CUDA(cudaMemcpy(state.job1, jobs1.data(), jobs_bytes,
                           cudaMemcpyHostToDevice));
 }
 
@@ -483,7 +570,7 @@ void initializeData(BenchState& state) {
     CHECK_CUDA(cudaStreamCreateWithFlags(&state.stream0, cudaStreamNonBlocking));
     fillPoolKernel<<<256, 256, 0, state.stream0>>>(
         reinterpret_cast<uint32_t*>(state.src_pool), state.pool_bytes / 4,
-        state.layer_stride_bytes / 4, state.page_bytes / 4);
+        state.layer_stride_bytes / 4, state.page_stride_bytes / 4);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaStreamSynchronize(state.stream0));
 
@@ -502,33 +589,60 @@ BenchState setup(const Options& opts) {
                        static_cast<size_t>(opts.head_dim) * 2u *
                        static_cast<size_t>(opts.dtype_bytes);
     if (state.page_bytes == 0 || state.page_bytes % sizeof(uint32_t) != 0) {
-        std::cerr << "page_stride_bytes must be nonzero and 4-byte aligned"
+        std::cerr << "page_bytes must be nonzero and 4-byte aligned"
                   << std::endl;
         std::exit(EXIT_FAILURE);
     }
+    const size_t page_padding_bytes =
+        static_cast<size_t>(opts.page_padding_bytes);
+    if (state.page_bytes >
+        std::numeric_limits<size_t>::max() - page_padding_bytes) {
+        std::cerr << "page stride overflows" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    state.page_stride_bytes = state.page_bytes + page_padding_bytes;
     state.page_words = state.page_bytes / sizeof(uint32_t);
     state.layer_stride_bytes =
-        static_cast<size_t>(opts.physical_pages) * state.page_bytes;
-    state.pool_bytes = static_cast<size_t>(opts.layers) * state.layer_stride_bytes;
+        static_cast<size_t>(opts.physical_pages) * state.page_stride_bytes;
+    state.pool_bytes =
+        static_cast<size_t>(opts.layers) * state.layer_stride_bytes;
     state.staging_bytes =
         static_cast<size_t>(opts.layers) * static_cast<size_t>(opts.pages) *
         state.page_bytes;
-    state.layout.page_stride_bytes = state.page_bytes;
+    state.layout.page_bytes = state.page_bytes;
+    state.layout.src_page_stride_bytes = state.page_stride_bytes;
+    state.layout.dst_page_stride_bytes = state.page_stride_bytes;
     state.layout.page_size_tokens = opts.page_size_tokens;
     state.layout.num_kv_heads = opts.num_kv_heads;
     state.layout.head_dim = opts.head_dim;
     state.layout.dtype_bytes = opts.dtype_bytes;
     state.layout.gin_resource_sharing = opts.gin_resource_sharing;
     state.layout.gin_opt_flags = static_cast<uint32_t>(opts.gin_opt_flags);
+    if (opts.split_jobs && opts.layers > 1) {
+        state.layout.uniform_job_num_pages = opts.pages;
+        state.layout.uniform_job_num_layers = 1;
+    }
 
     createComms(state);
     createDevComms(state);
     enablePeerAccess(state);
 
-    state.src_pool = ncclAllocOn(opts.device0, state.pool_bytes);
-    state.dst_pool = ncclAllocOn(opts.device1, state.pool_bytes);
-    state.src_staging = ncclAllocOn(opts.device0, state.staging_bytes);
-    state.dst_staging = ncclAllocOn(opts.device1, state.staging_bytes);
+    const size_t window_offset_bytes =
+        static_cast<size_t>(opts.window_offset_bytes);
+    state.src_pool =
+        ncclAllocOn(opts.device0, state.pool_bytes, window_offset_bytes);
+    state.dst_pool =
+        ncclAllocOn(opts.device1, state.pool_bytes, window_offset_bytes);
+    state.src_staging =
+        ncclAllocOn(opts.device0, state.staging_bytes, window_offset_bytes);
+    state.dst_staging =
+        ncclAllocOn(opts.device1, state.staging_bytes, window_offset_bytes);
+    state.src_pool_window_offset = requiredWindowOffset(state.src_pool);
+    state.dst_pool_window_offset = requiredWindowOffset(state.dst_pool);
+    state.src_staging_window_offset =
+        requiredWindowOffset(state.src_staging);
+    state.dst_staging_window_offset =
+        requiredWindowOffset(state.dst_staging);
     state.pool_window =
         registerWindowPair(state, state.src_pool, state.dst_pool,
                            state.pool_bytes);
@@ -559,20 +673,59 @@ double runFused(BenchState& state) {
     const unsigned long long signal = state.next_signal++;
     const auto start = std::chrono::steady_clock::now();
 
-    CHECK_CUDA(cudaSetDevice(state.opts.device1));
-    CHECK_CUDA(tentNcclGinLaunchWaitSignal(
-        state.dev_comm1, state.opts.lanes, 0, signal, state.stream1));
-
     CHECK_CUDA(cudaSetDevice(state.opts.device0));
     CHECK_CUDA(tentNcclGinLaunchPagedPut(
         state.dev_comm0, 1, state.opts.lanes, state.pool_window.rank0,
-        state.pool_window.rank0, state.layout, state.job0, 1, signal,
-        state.stream0));
+        state.pool_window.rank0, state.layout, state.job0,
+        state.fused_job_count, signal, state.stream0));
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device1));
+    CHECK_CUDA(tentNcclGinLaunchWaitSignal(
+        state.dev_comm1, state.opts.lanes, 0, signal, state.stream1));
 
     CHECK_CUDA(cudaSetDevice(state.opts.device1));
     CHECK_CUDA(cudaStreamSynchronize(state.stream1));
     CHECK_CUDA(cudaSetDevice(state.opts.device0));
     CHECK_CUDA(cudaStreamSynchronize(state.stream0));
+
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+double runFusedAck(BenchState& state) {
+    if (state.ack_signal_count + 1 < state.next_signal) {
+        CHECK_CUDA(cudaSetDevice(state.opts.device1));
+        for (unsigned long long target = state.ack_signal_count + 1;
+             target < state.next_signal; ++target) {
+            CHECK_CUDA(tentNcclGinLaunchWaitAck(
+                state.dev_comm1, 0, state.opts.lanes, target, state.stream1));
+        }
+        CHECK_CUDA(cudaStreamSynchronize(state.stream1));
+        state.ack_signal_count = state.next_signal - 1;
+    }
+
+    const unsigned long long signal = state.next_signal++;
+    const auto start = std::chrono::steady_clock::now();
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device0));
+    CHECK_CUDA(tentNcclGinLaunchPagedPut(
+        state.dev_comm0, 1, state.opts.lanes, state.pool_window.rank0,
+        state.pool_window.rank0, state.layout, state.job0,
+        state.fused_job_count, signal, state.stream0));
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device1));
+    CHECK_CUDA(tentNcclGinLaunchWaitAck(
+        state.dev_comm1, 0, state.opts.lanes, signal, state.stream1));
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device0));
+    CHECK_CUDA(tentNcclGinLaunchWaitSignal(
+        state.dev_comm0, state.opts.lanes, state.opts.lanes, signal,
+        state.stream0));
+    CHECK_CUDA(cudaStreamSynchronize(state.stream0));
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device1));
+    CHECK_CUDA(cudaStreamSynchronize(state.stream1));
+    state.ack_signal_count = signal;
 
     const auto end = std::chrono::steady_clock::now();
     return std::chrono::duration<double, std::milli>(end - start).count();
@@ -597,8 +750,9 @@ double runBaseline(BenchState& state) {
 
     CHECK_CUDA(cudaSetDevice(state.opts.device0));
     CHECK_CUDA(tentNcclGinLaunchPut(
-        state.dev_comm0, 1, state.opts.lanes, state.staging_window.rank0, 0,
-        state.staging_window.rank0, 0, state.staging_bytes, signal,
+        state.dev_comm0, 1, state.opts.lanes, state.staging_window.rank0,
+        state.dst_staging_window_offset, state.staging_window.rank0,
+        state.src_staging_window_offset, state.staging_bytes, signal,
         state.stream0));
 
     CHECK_CUDA(cudaSetDevice(state.opts.device1));
@@ -615,6 +769,59 @@ double runBaseline(BenchState& state) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+double runCoalescedLayerPut(BenchState& state) {
+    const unsigned long long signal = state.next_signal++;
+    const size_t layer_bytes = state.opts.pages * state.page_bytes;
+    const auto start = std::chrono::steady_clock::now();
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device1));
+    CHECK_CUDA(tentNcclGinLaunchWaitSignal(
+        state.dev_comm1, state.opts.lanes, 0, signal, state.stream1));
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device0));
+    for (int layer = 0; layer < state.opts.layers; ++layer) {
+        const size_t layer_offset =
+            static_cast<size_t>(layer) * state.layer_stride_bytes;
+        const bool last = layer + 1 == state.opts.layers;
+
+        CHECK_CUDA(tentNcclGinLaunchPut(
+            state.dev_comm0, 1, state.opts.lanes, state.pool_window.rank0,
+            state.dst_pool_window_offset + layer_offset,
+            state.pool_window.rank0,
+            state.src_pool_window_offset + layer_offset, layer_bytes,
+            last ? signal : 0, state.stream0));
+    }
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device1));
+    CHECK_CUDA(cudaStreamSynchronize(state.stream1));
+    CHECK_CUDA(cudaSetDevice(state.opts.device0));
+    CHECK_CUDA(cudaStreamSynchronize(state.stream0));
+
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+double runCoalescedPeerMemcpy(BenchState& state) {
+    const size_t layer_bytes = state.opts.pages * state.page_bytes;
+    const auto start = std::chrono::steady_clock::now();
+
+    CHECK_CUDA(cudaSetDevice(state.opts.device0));
+    for (int layer = 0; layer < state.opts.layers; ++layer) {
+        const size_t layer_offset =
+            static_cast<size_t>(layer) * state.layer_stride_bytes;
+        const char* src = static_cast<const char*>(state.src_pool) +
+                          layer_offset;
+        char* dst = static_cast<char*>(state.dst_pool) + layer_offset;
+        CHECK_CUDA(cudaMemcpyPeerAsync(
+            dst, state.opts.device1, src, state.opts.device0,
+            layer_bytes, state.stream0));
+    }
+    CHECK_CUDA(cudaStreamSynchronize(state.stream0));
+
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 double runPeerPageMemcpy(BenchState& state) {
     const auto start = std::chrono::steady_clock::now();
 
@@ -624,12 +831,14 @@ double runPeerPageMemcpy(BenchState& state) {
             static_cast<size_t>(layer) * state.layer_stride_bytes;
         for (int page_slot = 0; page_slot < state.opts.pages; ++page_slot) {
             const int src_page = page_slot;
-            const int dst_page = state.opts.physical_pages - 1 - page_slot;
+            const int dst_page =
+                state.opts.identity_map
+                    ? page_slot : state.opts.physical_pages - 1 - page_slot;
             const char* src = static_cast<const char*>(state.src_pool) +
                               layer_offset +
-                              static_cast<size_t>(src_page) * state.page_bytes;
+                              static_cast<size_t>(src_page) * state.page_stride_bytes;
             char* dst = static_cast<char*>(state.dst_pool) + layer_offset +
-                        static_cast<size_t>(dst_page) * state.page_bytes;
+                        static_cast<size_t>(dst_page) * state.page_stride_bytes;
             CHECK_CUDA(cudaMemcpyPeerAsync(dst, state.opts.device1, src,
                                            state.opts.device0, state.page_bytes,
                                            state.stream0));
@@ -700,7 +909,26 @@ int main(int argc, char** argv) {
     Options opts = parseOptions(argc, argv);
     validateOptions(opts);
 
+    if (opts.check_option_guard) {
+        if (opts.gin_opt_flags == ncclGinOptFlagsDefault) {
+            std::cerr << "--check-option-guard requires a non-default GIN flag"
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
+        TentNcclPagedKvLayout layout;
+        layout.page_stride_bytes = 1;
+        layout.gin_opt_flags = static_cast<uint32_t>(opts.gin_opt_flags);
+        ncclDevComm_t dev_comm{};
+        const cudaError_t err = tentNcclGinLaunchPagedPut(
+            dev_comm, 0, 1, nullptr, nullptr, layout, nullptr, 0, 0, nullptr);
+        std::cout << "option_guard flags=" << opts.gin_opt_flags
+                  << " result=" << cudaGetErrorName(err) << std::endl;
+        return err == cudaErrorNotSupported ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     BenchState state = setup(opts);
+    const bool coalesced_control =
+        opts.identity_map && state.page_stride_bytes == state.page_bytes;
     const uint64_t work_items =
         static_cast<uint64_t>(opts.layers) * static_cast<uint64_t>(opts.pages);
     std::cout << "paged_gin_kv_bench devices=" << opts.device0 << ","
@@ -708,8 +936,14 @@ int main(int argc, char** argv) {
               << " layers=" << opts.layers << " pages=" << opts.pages
               << " physical_pages=" << opts.physical_pages
               << " page_bytes=" << state.page_bytes
+              << " page_stride_bytes=" << state.page_stride_bytes
+              << " window_offset_bytes=" << opts.window_offset_bytes
+              << " src_window_offset=" << state.src_pool_window_offset
+              << " dst_window_offset=" << state.dst_pool_window_offset
               << " gin_sharing=" << opts.gin_resource_sharing
               << " gin_opt_flags=" << opts.gin_opt_flags
+              << " jobs=" << state.fused_job_count
+              << " map=" << (opts.identity_map ? "identity" : "reverse")
               << " total_page_copies=" << work_items << std::endl;
     std::cout << "pool_bytes_per_rank=" << mib(state.pool_bytes)
               << " staging_bytes_per_rank=" << mib(state.staging_bytes)
@@ -722,6 +956,14 @@ int main(int argc, char** argv) {
         std::cout << "fused_validation_errors=" << fused_errors << std::endl;
         if (fused_errors != 0) return EXIT_FAILURE;
 
+        if (opts.with_ack) {
+            resetDestination(state);
+            runFusedAck(state);
+            const uint64_t ack_errors = verifyDestination(state);
+            std::cout << "ack_validation_errors=" << ack_errors << std::endl;
+            if (ack_errors != 0) return EXIT_FAILURE;
+        }
+
         if (opts.baseline) {
             resetDestination(state);
             runBaseline(state);
@@ -729,6 +971,22 @@ int main(int argc, char** argv) {
             std::cout << "baseline_validation_errors=" << baseline_errors
                       << std::endl;
             if (baseline_errors != 0) return EXIT_FAILURE;
+        }
+
+        if (coalesced_control) {
+            resetDestination(state);
+            runCoalescedLayerPut(state);
+            const uint64_t coalesced_errors = verifyDestination(state);
+            std::cout << "coalesced_validation_errors=" << coalesced_errors
+                      << std::endl;
+            if (coalesced_errors != 0) return EXIT_FAILURE;
+            resetDestination(state);
+            runCoalescedPeerMemcpy(state);
+            const uint64_t coalesced_peer_errors = verifyDestination(state);
+            std::cout << "coalesced_peer_validation_errors="
+                      << coalesced_peer_errors << std::endl;
+            if (coalesced_peer_errors != 0) return EXIT_FAILURE;
+
         }
 
         resetDestination(state);
@@ -741,9 +999,20 @@ int main(int argc, char** argv) {
 
     resetDestination(state);
     runAndReport(state, "paged_gin_put", runFused);
+    if (opts.with_ack) {
+        resetDestination(state);
+        runAndReport(state, "paged_gin_put_ack", runFusedAck);
+    }
+
     if (opts.baseline) {
         resetDestination(state);
         runAndReport(state, "gather_put_scatter", runBaseline);
+    }
+    if (coalesced_control) {
+        resetDestination(state);
+        runAndReport(state, "coalesced_layer_put", runCoalescedLayerPut);
+        resetDestination(state);
+        runAndReport(state, "coalesced_peer_copy", runCoalescedPeerMemcpy);
     }
     resetDestination(state);
     runAndReport(state, "peer_page_memcpy", runPeerPageMemcpy);

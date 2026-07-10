@@ -736,7 +736,8 @@ PYBIND11_MODULE(tent, m) {
                const std::vector<uint64_t>& dst_layer_ptrs,
                const std::vector<int32_t>& src_page_indices,
                const std::vector<int32_t>& dst_page_indices,
-               size_t page_bytes) {
+               size_t page_bytes, size_t src_page_stride_bytes,
+               size_t dst_page_stride_bytes) {
                 py::gil_scoped_release release;
                 PagedTransferRequest request;
                 request.target_id = (SegmentID)target_id;
@@ -746,10 +747,14 @@ PYBIND11_MODULE(tent, m) {
                 request.src_page_indices = src_page_indices;
                 request.dst_page_indices = dst_page_indices;
                 request.page_bytes = page_bytes;
+                request.src_page_stride_bytes = src_page_stride_bytes;
+                request.dst_page_stride_bytes = dst_page_stride_bytes;
                 auto s = self.transferPagedSync(request);
                 ThrowStatus(s, "transfer_paged_sync");
             },
             py::arg("target_id"), py::arg("src_layer_ptrs"),
             py::arg("dst_layer_ptrs"), py::arg("src_page_indices"),
-            py::arg("dst_page_indices"), py::arg("page_bytes"));
+            py::arg("dst_page_indices"), py::arg("page_bytes"),
+            py::arg("src_page_stride_bytes") = 0,
+            py::arg("dst_page_stride_bytes") = 0);
 }

@@ -30,6 +30,13 @@ struct TentNcclPagedKvLayout {
     int dtype_bytes = 0;
     int gin_resource_sharing = NCCL_GIN_RESOURCE_SHARING_CTA;
     uint32_t gin_opt_flags = ncclGinOptFlagsDefault;
+    size_t page_bytes = 0;
+    size_t src_page_stride_bytes = 0;
+    size_t dst_page_stride_bytes = 0;
+    // Positive only when every job has this shape. These host-validated hints
+    // let the kernel schedule the jobs as one flattened work list.
+    int uniform_job_num_pages = 0;
+    int uniform_job_num_layers = 0;
 };
 
 struct TentNcclPagedTransferJob {
@@ -42,6 +49,14 @@ struct TentNcclPagedTransferJob {
     size_t dst_layer_stride = 0;
     size_t src_base_offset = 0;
     size_t dst_base_offset = 0;
+    const size_t* src_layer_offsets = nullptr;
+    const size_t* dst_layer_offsets = nullptr;
+    ncclWindow_t dst_window = nullptr;
+    ncclWindow_t src_window = nullptr;
+    size_t page_stride_bytes = 0;
+    size_t page_bytes = 0;
+    size_t src_page_stride_bytes = 0;
+    size_t dst_page_stride_bytes = 0;
 };
 
 #ifdef __cplusplus
