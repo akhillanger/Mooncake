@@ -119,7 +119,8 @@ class NcclTransport : public Transport {
     Status markFailed(NcclTask& task, const std::string& reason);
     Status buildTransferContext(const Request& request, TransferContext& ctx);
     Status buildTransferContext(const Request& request, size_t source_length,
-                                size_t target_length, TransferContext& ctx);
+                                size_t target_length, TransferContext& ctx,
+                                bool use_full_buffer_extents);
     Status ensureComm(const TransferContext& ctx,
                       std::shared_ptr<CommState>& state);
     Status ensureWindow(const TransferContext& ctx,
@@ -128,6 +129,24 @@ class NcclTransport : public Transport {
     Status ensureSourceWindow(const TransferContext& ctx,
                               const std::shared_ptr<CommState>& comm_state,
                               std::shared_ptr<WindowState>& state);
+    Status ensurePairedWindow(const TransferContext& ctx,
+                              const std::shared_ptr<CommState>& comm_state,
+                              std::shared_ptr<WindowState>& state);
+    Status ensurePagedWindowsBatch(
+        const std::vector<TransferContext>& contexts,
+        const std::shared_ptr<CommState>& comm_state,
+        std::vector<std::shared_ptr<WindowState>>& target_states,
+        std::vector<std::shared_ptr<WindowState>>& source_states);
+    Status copySourceWindowBytes(const TransferContext& ctx,
+                                 const std::shared_ptr<WindowState>& state,
+                                 bool to_window, cudaStream_t stream);
+    Status releaseWindow(const std::string& window_key);
+    Status releaseCachedWindowsForSession(const TransferContext& ctx);
+    Status releaseRemoteWindow(const TransferContext& ctx,
+                               const std::string& window_key);
+    Status releaseRemoteWindowsBatch(
+        const TransferContext& ctx,
+        const std::vector<std::string>& window_keys);
     Status postRemoteWaitSignal(const TransferContext& ctx,
                                 uint64_t signal_value);
     Status waitForComm(const std::string& session_key,
@@ -136,6 +155,12 @@ class NcclTransport : public Transport {
                            NcclBootstrapDesc& response);
     Status onRegisterNcclWindow(const NcclWindowDesc& request,
                                 NcclWindowDesc& response);
+    Status onDeregisterNcclWindow(const NcclWindowDesc& request,
+                                  NcclWindowDesc& response);
+    Status onRegisterNcclWindowBatch(const NcclWindowBatchDesc& request,
+                                     NcclWindowBatchDesc& response);
+    Status onDeregisterNcclWindowBatch(const NcclWindowBatchDesc& request,
+                                       NcclWindowBatchDesc& response);
     Status onWaitNcclSignal(const NcclSignalDesc& request,
                             NcclSignalDesc& response);
     void startTransfer(NcclTask* task, NcclSubBatch* batch);

@@ -71,6 +71,47 @@ Status ControlClient::registerNcclWindow(const std::string& server_addr,
                                       : Status::RpcServiceError(response.reply_msg);
 }
 
+Status ControlClient::deregisterNcclWindow(const std::string& server_addr,
+                                           const NcclWindowDesc& request,
+                                           NcclWindowDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, DeregisterNcclWindow,
+                                   request_raw, response_raw));
+    response = json::parse(response_raw).get<NcclWindowDesc>();
+    return response.reply_msg.empty() ? Status::OK()
+                                      : Status::RpcServiceError(response.reply_msg);
+}
+
+Status ControlClient::registerNcclWindowBatch(
+    const std::string& server_addr, const NcclWindowBatchDesc& request,
+    NcclWindowBatchDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, RegisterNcclWindowBatch,
+                                   request_raw, response_raw));
+    response = json::parse(response_raw).get<NcclWindowBatchDesc>();
+    return response.reply_msg.empty()
+               ? Status::OK()
+               : Status::RpcServiceError(response.reply_msg);
+}
+
+Status ControlClient::deregisterNcclWindowBatch(
+    const std::string& server_addr, const NcclWindowBatchDesc& request,
+    NcclWindowBatchDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, DeregisterNcclWindowBatch,
+                                   request_raw, response_raw));
+    response = json::parse(response_raw).get<NcclWindowBatchDesc>();
+    return response.reply_msg.empty()
+               ? Status::OK()
+               : Status::RpcServiceError(response.reply_msg);
+}
+
 Status ControlClient::waitNcclSignal(const std::string& server_addr,
                                      const NcclSignalDesc& request,
                                      NcclSignalDesc& response) {
@@ -230,6 +271,21 @@ ControlService::ControlService(const std::string& type,
             onRegisterNcclWindow(request, response);
         });
     rpc_server_->registerFunction(
+        DeregisterNcclWindow,
+        [this](const std::string_view& request, std::string& response) {
+            onDeregisterNcclWindow(request, response);
+        });
+    rpc_server_->registerFunction(
+        RegisterNcclWindowBatch,
+        [this](const std::string_view& request, std::string& response) {
+            onRegisterNcclWindowBatch(request, response);
+        });
+    rpc_server_->registerFunction(
+        DeregisterNcclWindowBatch,
+        [this](const std::string_view& request, std::string& response) {
+            onDeregisterNcclWindowBatch(request, response);
+        });
+    rpc_server_->registerFunction(
         WaitNcclSignal,
         [this](const std::string_view& request, std::string& response) {
             onWaitNcclSignal(request, response);
@@ -336,6 +392,58 @@ void ControlService::onRegisterNcclWindow(const std::string_view& request,
         nccl_window_callback_(request_desc, response_desc);
     } else {
         response_desc.reply_msg = "NCCL window callback not registered";
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onDeregisterNcclWindow(const std::string_view& request,
+                                            std::string& response) {
+    NcclWindowDesc request_desc =
+        json::parse(std::string(request)).get<NcclWindowDesc>();
+    NcclWindowDesc response_desc;
+    response_desc.session_key = request_desc.session_key;
+    response_desc.window_key = request_desc.window_key;
+    response_desc.addr = request_desc.addr;
+    response_desc.length = request_desc.length;
+    response_desc.device_index = request_desc.device_index;
+    response_desc.win_flags = request_desc.win_flags;
+    response_desc.allocate_local = request_desc.allocate_local;
+    if (nccl_window_deregister_callback_) {
+        nccl_window_deregister_callback_(request_desc, response_desc);
+    } else {
+        response_desc.reply_msg = "NCCL window deregister callback not registered";
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onRegisterNcclWindowBatch(
+    const std::string_view& request, std::string& response) {
+    NcclWindowBatchDesc request_desc =
+        json::parse(std::string(request)).get<NcclWindowBatchDesc>();
+    NcclWindowBatchDesc response_desc;
+    response_desc.windows = request_desc.windows;
+    if (nccl_window_batch_callback_) {
+        nccl_window_batch_callback_(request_desc, response_desc);
+    } else {
+        response_desc.reply_msg = "NCCL window batch callback not registered";
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onDeregisterNcclWindowBatch(
+    const std::string_view& request, std::string& response) {
+    NcclWindowBatchDesc request_desc =
+        json::parse(std::string(request)).get<NcclWindowBatchDesc>();
+    NcclWindowBatchDesc response_desc;
+    response_desc.windows = request_desc.windows;
+    if (nccl_window_batch_deregister_callback_) {
+        nccl_window_batch_deregister_callback_(request_desc, response_desc);
+    } else {
+        response_desc.reply_msg =
+            "NCCL window batch deregister callback not registered";
     }
     json j = response_desc;
     response = j.dump();

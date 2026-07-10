@@ -106,7 +106,9 @@ struct PagedTransferRequest {
     std::vector<uint64_t> dst_layer_ptrs;
     std::vector<int32_t> src_page_indices;
     std::vector<int32_t> dst_page_indices;
-    size_t page_bytes = 0;
+    size_t page_bytes = 0;             // Payload bytes copied per page.
+    size_t src_page_stride_bytes = 0;  // Zero means page_bytes.
+    size_t dst_page_stride_bytes = 0;  // Zero means page_bytes.
 };
 
 enum TransferStatusEnum {
