@@ -25,17 +25,22 @@
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
+#include <limits.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unistd.h>
 
 #include "cuda_alike.h"
+#include "environ.h"
 #include "transport/device/ibgda/memheap.h"
 #include "transport/device/ibgda/mlx5_ifc.h"
 #include "transport/device/ibgda/mlx5gda.h"
+#include "transport/rdma_transport/rdma_context.h"
 #include "topology.h"
 
 namespace mooncake {
@@ -83,6 +88,46 @@ static Mlx5DevxUmemRegEx dmabufUmemRegEx() {
 }
 #endif
 
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+using Mlx5RegDmabufMr = ibv_mr* (*)(ibv_pd*, uint64_t, size_t, uint64_t, int,
+                                    int, int);
+using Mlx5GetDataDirectSysfsPath = int (*)(ibv_context*, char*, size_t);
+
+static Mlx5RegDmabufMr dataDirectRegDmabufMr() {
+    static const Mlx5RegDmabufMr reg = [] {
+        dlerror();
+        void* symbol =
+            dlvsym(RTLD_DEFAULT, "mlx5dv_reg_dmabuf_mr", "MLX5_1.25");
+        if (!symbol) {
+            const char* error = dlerror();
+            LOG(WARNING) << "[EP IBGDA] Runtime libmlx5 does not provide "
+                            "mlx5dv_reg_dmabuf_mr@MLX5_1.25; disabling "
+                            "DataDirect payload registration"
+                         << (error ? std::string(": ") + error : "");
+        }
+        return reinterpret_cast<Mlx5RegDmabufMr>(symbol);
+    }();
+    return reg;
+}
+
+static Mlx5GetDataDirectSysfsPath dataDirectSysfsPath() {
+    static const Mlx5GetDataDirectSysfsPath get_path = [] {
+        dlerror();
+        void* symbol = dlvsym(RTLD_DEFAULT, "mlx5dv_get_data_direct_sysfs_path",
+                              "MLX5_1.25");
+        if (!symbol) {
+            const char* error = dlerror();
+            LOG(WARNING) << "[EP IBGDA] Runtime libmlx5 does not provide "
+                            "mlx5dv_get_data_direct_sysfs_path@MLX5_1.25; "
+                            "disabling DataDirect NIC selection"
+                         << (error ? std::string(": ") + error : "");
+        }
+        return reinterpret_cast<Mlx5GetDataDirectSysfsPath>(symbol);
+    }();
+    return get_path;
+}
+#endif
+
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
     return ((a->s6_addr32[0] | a->s6_addr32[1]) == 0 &&
@@ -107,6 +152,76 @@ static int findBestGidIndex(ibv_context* ctx, uint8_t port,
     return -1;
 }
 
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+static size_t commonPathPrefixLength(const std::string& lhs,
+                                     const std::string& rhs) {
+    if (lhs == rhs) return lhs.size() + 1;
+    size_t common = 0;
+    while (common < lhs.size() && common < rhs.size() &&
+           lhs[common] == rhs[common]) {
+        ++common;
+    }
+    while (common > 0 && lhs[common - 1] != '/') --common;
+    return common;
+}
+
+// GB200/GB300-class systems expose a second sysfs location for an mlx5 HCA's
+// direct GPU DMA interface. The physical HCA PCI path can select the wrong
+// rail; use the DataDirect path when DMA-BUF registration is requested.
+static std::string autoDetectDataDirectNic(
+    const std::vector<std::string>& candidates, int device_id) {
+    const auto getDataDirectPath = dataDirectSysfsPath();
+    if (!getDataDirectPath || !dataDirectRegDmabufMr()) return "";
+
+    char busId[32]{};
+    if (cudaDeviceGetPCIBusId(busId, sizeof(busId), device_id) != cudaSuccess) {
+        return "";
+    }
+
+    char gpuLink[PATH_MAX]{};
+    std::string gpuSysfs = std::string("/sys/bus/pci/devices/") + busId;
+    if (!realpath(gpuSysfs.c_str(), gpuLink)) return "";
+
+    int numDevices = 0;
+    ibv_device** devices = ibv_get_device_list(&numDevices);
+    if (!devices) return "";
+
+    std::string bestNic;
+    std::string bestPath;
+    size_t bestScore = 0;
+    for (int i = 0; i < numDevices; ++i) {
+        const std::string name = ibv_get_device_name(devices[i]);
+        if (std::find(candidates.begin(), candidates.end(), name) ==
+            candidates.end()) {
+            continue;
+        }
+
+        ibv_context* context = ibv_open_device(devices[i]);
+        if (!context) continue;
+        char dataDirectPath[PATH_MAX] = "/sys";
+        const int ret = getDataDirectPath(context, dataDirectPath + 4,
+                                          sizeof(dataDirectPath) - 4);
+        ibv_close_device(context);
+        if (ret != 0) continue;
+
+        const size_t score = commonPathPrefixLength(gpuLink, dataDirectPath);
+        if (score > bestScore) {
+            bestScore = score;
+            bestNic = name;
+            bestPath = dataDirectPath;
+        }
+    }
+    ibv_free_device_list(devices);
+
+    // A match must extend beyond the generic /sys/devices/ prefix.
+    if (bestScore <= std::strlen("/sys/devices/")) return "";
+    LOG(INFO) << "[EP IBGDA] GPU " << device_id << " DataDirect rail "
+              << bestNic << " (gpu_path=" << gpuLink
+              << ", dma_path=" << bestPath << ")";
+    return bestNic;
+}
+#endif
+
 // Auto-detect the best NIC for the current GPU using TE's Topology.
 // filter: if non-empty, only consider NICs in this list.
 static std::string autoDetectNic(const std::vector<std::string>& filter) {
@@ -119,6 +234,13 @@ static std::string autoDetectNic(const std::vector<std::string>& filter) {
     // topologically closest NIC.  Fall back to wildcard if cudaGetDevice fails.
     int device_id = 0;
     cudaGetDevice(&device_id);
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    if (!Environ::Get().GetWithNvidiaPeermem()) {
+        std::string dataDirectNic =
+            autoDetectDataDirectNic(hca_list, device_id);
+        if (!dataDirectNic.empty()) return dataDirectNic;
+    }
+#endif
     std::string location = "cuda:" + std::to_string(device_id);
 
     int idx = topo.selectDevice(location);
@@ -231,15 +353,70 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int registerMemory(void* ptr, size_t bytes) override {
-        mr_ =
-            ibv_reg_mr(pd_, ptr, bytes,
-                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
-        if (!mr_) {
-            LOG(ERROR) << "[EP IBGDA] ibv_reg_mr failed";
+        if (mr_) {
+            LOG(ERROR) << "[EP IBGDA] Memory is already registered";
             return -1;
         }
+
+        constexpr int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                               IBV_ACCESS_REMOTE_WRITE |
+                               IBV_ACCESS_REMOTE_ATOMIC;
+
+        bool preferDataDirect = false;
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+        preferDataDirect = dataDirectRegDmabufMr() != nullptr;
+#endif
+        DmabufExport dmabuf;
+        if (RdmaContext::exportDmabuf(ptr, dmabuf, preferDataDirect) != 0) {
+            LOG(ERROR) << "[EP IBGDA] Failed to export payload as dma_buf";
+            return -1;
+        }
+
+        if (dmabuf.method == DmabufExport::Method::kDmabufReg) {
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+            if (dmabuf.data_direct) {
+                constexpr int kDataDirectAccess = 1 << 0;
+                mr_ = dataDirectRegDmabufMr()(
+                    pd_, dmabuf.offset, bytes, reinterpret_cast<uintptr_t>(ptr),
+                    dmabuf.fd, access, kDataDirectAccess);
+                if (!mr_) {
+                    const int dataDirectErrno = errno;
+                    RdmaContext::closeDmabufExport(dmabuf);
+                    errno = dataDirectErrno;
+                    PLOG(WARNING)
+                        << "[EP IBGDA] mlx5 DataDirect registration failed; "
+                           "retrying with a legacy DMA-BUF mapping";
+                    if (RdmaContext::exportDmabuf(
+                            ptr, dmabuf,
+                            /*prefer_data_direct=*/false) != 0) {
+                        return -1;
+                    }
+                }
+            }
+#endif
+            if (!mr_) {
+                mr_ = ibv_reg_dmabuf_mr(pd_, dmabuf.offset, bytes,
+                                        reinterpret_cast<uintptr_t>(ptr),
+                                        dmabuf.fd, access);
+            }
+        } else {
+            mr_ = ibv_reg_mr(pd_, ptr, bytes, access);
+        }
+
+        const int registration_errno = errno;
+        RdmaContext::closeDmabufExport(dmabuf);
+        errno = registration_errno;
+        if (!mr_) {
+            PLOG(ERROR) << "[EP IBGDA] payload memory registration failed";
+            return -1;
+        }
+
         mr_ptr_ = ptr;
+        LOG(INFO) << "[EP IBGDA] Registered " << bytes << " payload bytes via "
+                  << (dmabuf.method == DmabufExport::Method::kHostReg
+                          ? "ibv_reg_mr"
+                          : (dmabuf.data_direct ? "DMA-BUF DataDirect"
+                                                : "DMA-BUF"));
         return 0;
     }
 
@@ -397,7 +574,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     RdmaLocalMetadata localMetadata() const override {
         RdmaLocalMetadata meta;
-        meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_->addr) : 0;
+        // DMA-BUF creates an IOVA-based MR whose mr->addr is not guaranteed
+        // to contain the original CUDA virtual address.
+        meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_ptr_) : 0;
         meta.rkey = mr_ ? static_cast<int32_t>(mr_->rkey) : 0;
         meta.subnet_prefix = static_cast<int64_t>(gid_.global.subnet_prefix);
         meta.interface_id = static_cast<int64_t>(gid_.global.interface_id);

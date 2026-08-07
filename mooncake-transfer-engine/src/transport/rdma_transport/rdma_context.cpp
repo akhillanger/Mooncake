@@ -26,6 +26,7 @@
 #include <cassert>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <thread>
 
@@ -389,9 +390,11 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
+int RdmaContext::exportDmabuf(void *addr, DmabufExport &out,
+                              bool prefer_data_direct) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
+    (void)prefer_data_direct;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_SUPA)
     // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
@@ -424,11 +427,10 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
         cuCtxSetCurrent(cuCtx);
 
-        // Use cuMemGetAddressRange to get the true allocation base and
-        // size — addr may sit at an offset within a larger cudaMalloc
-        // block (e.g. PyTorch caching allocator packs multiple tensors
-        // into one allocation).  cuMemGetHandleForAddressRange requires
-        // the exact allocation boundaries.
+        // Use cuMemGetAddressRange to get the allocation base and size — addr
+        // may sit at an offset within a larger cudaMalloc block (e.g. PyTorch's
+        // caching allocator packs multiple tensors into one allocation). The
+        // CUDA export range starts at that base and is page-aligned below.
 #endif
         CUdeviceptr allocBase;
         size_t allocSize;
@@ -445,18 +447,50 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
             return ERR_CONTEXT;
         }
 
+        size_t exportSize = allocSize;
+#if defined(USE_CUDA)
+        // CUDA requires the exported address and size to be host-page aligned.
+        // cudaMalloc may report the caller-requested, unaligned size even
+        // though its backing allocation is page granular.
+        const long hostPageSize = sysconf(_SC_PAGESIZE);
+        if (hostPageSize <= 0 ||
+            allocSize > std::numeric_limits<size_t>::max() -
+                            (static_cast<size_t>(hostPageSize) - 1)) {
+            LOG(ERROR) << "Invalid host page size or allocation size for "
+                          "dmabuf export: page_size="
+                       << hostPageSize << " alloc_size=" << allocSize;
+            cuDevicePrimaryCtxRelease(cuDev);
+            return ERR_CONTEXT;
+        }
+        const size_t pageSize = static_cast<size_t>(hostPageSize);
+        exportSize = ((allocSize + pageSize - 1) / pageSize) * pageSize;
+#endif
+
         int dmabuf_fd;
-        // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
-        // on some GPU/driver combinations (e.g. B200).
-        result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, allocBase, allocSize,
-            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+        bool exportedDataDirect = false;
+#if defined(USE_CUDA) && CUDA_VERSION >= 12080
+        // Prefer the PCIe mapping used by mlx5 DataDirect. Platforms that do
+        // not support it retain the legacy flags=0 compatibility path.
+        if (prefer_data_direct) {
+            result = cuMemGetHandleForAddressRange(
+                &dmabuf_fd, allocBase, exportSize,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+            exportedDataDirect = (result == CUDA_SUCCESS);
+        }
+#endif
+        if (!exportedDataDirect) {
+            result = cuMemGetHandleForAddressRange(
+                &dmabuf_fd, allocBase, exportSize,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+        }
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
                        << " base=" << (uintptr_t)allocBase
-                       << " size=" << allocSize << " cuda error=" << errStr;
+                       << " size=" << allocSize << " export_size=" << exportSize
+                       << " cuda error=" << errStr;
 #if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -464,6 +498,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         }
         out.method = DmabufExport::Method::kDmabufReg;
         out.fd = dmabuf_fd;
+        out.data_direct = exportedDataDirect;
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
 #if defined(USE_CUDA) || defined(USE_SUPA)
         cuDevicePrimaryCtxRelease(cuDev);

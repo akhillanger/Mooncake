@@ -97,8 +97,9 @@ struct MemoryRegionMeta {
 struct DmabufExport {
     enum class Method { kHostReg, kDmabufReg };
     Method method = Method::kHostReg;
-    int fd = -1;          // live dma_buf fd; -1 when not applicable
-    uint64_t offset = 0;  // offset of addr within the exported allocation
+    int fd = -1;               // live dma_buf fd; -1 when not applicable
+    uint64_t offset = 0;       // offset of addr within the exported allocation
+    bool data_direct = false;  // fd uses the mlx5 PCIe/DataDirect mapping
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -137,8 +138,11 @@ class RdmaContext {
     // MUST be closed by the caller (via closeDmabufExport) AFTER every
     // registerMemoryRegion() call consuming it has returned — each successful
     // registration takes its own reference, so closing earlier would invalidate
-    // the fd for the remaining NICs.
-    static int exportDmabuf(void *addr, DmabufExport &out);
+    // the fd for the remaining NICs. If prefer_data_direct is true, CUDA first
+    // tries a PCIe/DataDirect mapping and marks out.data_direct when the caller
+    // must import it with the corresponding mlx5 DataDirect access flag.
+    static int exportDmabuf(void *addr, DmabufExport &out,
+                            bool prefer_data_direct = false);
 
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);

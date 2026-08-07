@@ -58,6 +58,7 @@ TEST(DmabufExport, DefaultIsHostRegWithNoFd) {
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
     EXPECT_EQ(exp.offset, 0u);
+    EXPECT_FALSE(exp.data_direct);
 }
 
 // ── closeDmabufExport ────────────────────────────────────────────────────────
