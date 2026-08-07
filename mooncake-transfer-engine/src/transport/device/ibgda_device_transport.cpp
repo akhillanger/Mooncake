@@ -653,47 +653,62 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         static const long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0) {
-            LOG(ERROR) << "[EP IBGDA] Failed to query host page size";
+        if (page_size <= 0 || (static_cast<size_t>(page_size) &
+                               (static_cast<size_t>(page_size) - 1)) != 0) {
+            LOG(ERROR) << "[EP IBGDA] Invalid host page size: " << page_size;
             errno = EIO;
             return -1;
         }
         const size_t page_mask = static_cast<size_t>(page_size) - 1;
+        if (requested_size > SIZE_MAX - page_mask) {
+            errno = EOVERFLOW;
+            return -1;
+        }
         const size_t size = (requested_size + page_mask) & ~page_mask;
-
-        void* addr = nullptr;
-        cudaError_t cuda_error = cudaMalloc(&addr, size);
-        if (cuda_error != cudaSuccess) {
-            LOG(ERROR) << "[EP IBGDA] cudaMalloc failed for DMA-BUF control "
-                          "region size="
-                       << size << ": " << cudaGetErrorString(cuda_error);
-            errno = cuda_error == cudaErrorMemoryAllocation ? ENOMEM : EIO;
+        if (size > SIZE_MAX - page_mask) {
+            errno = EOVERFLOW;
             return -1;
         }
 
+        // cuMemGetHandleForAddressRange requires host-page alignment, but
+        // cuMemAlloc is only guaranteed to satisfy CUDA allocation alignment.
+        // Over-allocate and export a host-page-aligned subrange while retaining
+        // the original address for cuMemFree.
+        const size_t allocation_size = size + page_mask;
+        CUdeviceptr allocation = 0;
+        CUresult result = cuMemAlloc(&allocation, allocation_size);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "[EP IBGDA] cuMemAlloc failed for DMA-BUF control "
+                          "region size="
+                       << allocation_size << ": " << cudaDriverError(result);
+            errno = result == CUDA_ERROR_OUT_OF_MEMORY ? ENOMEM : EIO;
+            return -1;
+        }
+        const CUdeviceptr aligned =
+            (allocation + page_mask) & ~static_cast<CUdeviceptr>(page_mask);
+        void* addr = reinterpret_cast<void*>(aligned);
+
         int sync_memops = 1;
-        CUresult result = cuPointerSetAttribute(
-            &sync_memops, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
-            reinterpret_cast<CUdeviceptr>(addr));
+        result = cuPointerSetAttribute(
+            &sync_memops, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, aligned);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "[EP IBGDA] Failed to enable synchronous memory "
                           "operations for DMA-BUF control memory: "
                        << cudaDriverError(result);
-            cudaFree(addr);
+            cuMemFree(allocation);
             errno = EIO;
             return -1;
         }
 
         int dmabuf_fd = -1;
         result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, reinterpret_cast<CUdeviceptr>(addr), size,
-            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            &dmabuf_fd, aligned, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "[EP IBGDA] Failed to export DMA-BUF control memory "
                           "at "
                        << addr << " size=" << size << ": "
                        << cudaDriverError(result);
-            cudaFree(addr);
+            cuMemFree(allocation);
             errno = EIO;
             return -1;
         }
@@ -716,11 +731,12 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             errno = registration_errno;
             PLOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg_ex failed for "
                            "GPU DMA-BUF control memory";
-            cudaFree(addr);
+            cuMemFree(allocation);
             return -1;
         }
         *region = mlx5gda_control_region{
             .addr = addr,
+            .allocation_base = reinterpret_cast<void*>(allocation),
             .size = size,
             .umem = umem,
         };
@@ -736,7 +752,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     void releaseDmabufControlRegion(mlx5gda_control_region* region) {
         if (!region) return;
         if (region->umem) mlx5dv_devx_umem_dereg(region->umem);
-        if (region->addr) cudaFree(region->addr);
+        void* allocation =
+            region->allocation_base ? region->allocation_base : region->addr;
+        if (allocation) cuMemFree(reinterpret_cast<CUdeviceptr>(allocation));
         *region = {};
     }
 

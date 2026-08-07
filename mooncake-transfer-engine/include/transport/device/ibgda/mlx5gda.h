@@ -29,6 +29,8 @@ struct mlx5gda_wqebb {
 
 struct mlx5gda_control_region {
     void *addr;
+    void
+        *allocation_base;  // raw CUDA allocation; addr may be aligned within it
     size_t size;
     struct mlx5dv_devx_umem *umem;
 };
