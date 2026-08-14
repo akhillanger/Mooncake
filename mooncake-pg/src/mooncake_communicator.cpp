@@ -15,6 +15,7 @@
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
+#include "nccl_collective_executor.h"
 
 namespace mooncake {
 namespace {
@@ -259,6 +260,29 @@ PGResult<void> MooncakePGContext::setExternalEngine(
     return {};
 }
 
+PGResult<void> MooncakePGContext::setGpuCollectiveBackend(
+    GpuCollectiveBackend backend) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    PG_TRY(checkRunning());
+    switch (backend) {
+        case GpuCollectiveBackend::Auto:
+        case GpuCollectiveBackend::TransferEngine:
+            break;
+        case GpuCollectiveBackend::Nccl:
+            PG_VALIDATE_STATE(NcclCollectiveExecutor::isCompiled(),
+                              "Mooncake PG was built without USE_NCCL_PG");
+            break;
+        default:
+            return makePGError(PGErrorCode::InvalidArgument,
+                               "invalid GPU collective backend");
+    }
+    PG_VALIDATE_STATE(comm_use_count_ == 0 || gpu_collective_backend == backend,
+                      "GPU collective backend cannot be changed while a "
+                      "communicator is active");
+    if (comm_use_count_ == 0) gpu_collective_backend = backend;
+    return {};
+}
+
 PGResult<void> MooncakePGContext::setDeviceFilter(
     std::vector<std::string> filters) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -438,6 +462,22 @@ PGResult<void> MooncakeCommunicator::initialize(
             GpuStream::createNonBlocking(active_ranks_mirror_device_index_);
     }
 
+    const bool nccl_selected =
+        context_.gpu_collective_backend == GpuCollectiveBackend::Nccl ||
+        (context_.gpu_collective_backend == GpuCollectiveBackend::Auto &&
+         NcclCollectiveExecutor::isCompiled());
+    const bool nccl_eligible =
+        !is_cpu_ && initial_size_ > 1 &&
+        config.group_resolve_policy ==
+            GroupBootstrapIdResolvePolicy::CreateOrAttach;
+    if (nccl_selected && nccl_eligible) {
+        nccl_collectives_ = std::make_unique<NcclCollectiveExecutor>();
+    } else if (context_.gpu_collective_backend == GpuCollectiveBackend::Nccl &&
+               !is_cpu_ && initial_size_ > 1) {
+        LOG(WARNING) << "NCCL collectives are unavailable to an extension "
+                        "communicator; using Transfer Engine";
+    }
+
     // Register collective buffers.
     for (size_t index = 0; index < 2; ++index) {
         if (is_cpu_) {
@@ -535,7 +575,15 @@ PGResult<void> MooncakeCommunicator::initialize(
         .p2p_credit_region =
             reinterpret_cast<uint64_t>(p2p_proxy_->credit_region()),
         .p2p_ack_region = reinterpret_cast<uint64_t>(p2p_proxy_->ack_region()),
+        .nccl_collectives_enabled = nccl_collectives_ != nullptr,
     };
+
+    if (nccl_collectives_ && rank_ == 0) {
+        PG_TRY(auto unique_id, NcclCollectiveExecutor::createUniqueId());
+        auto& endpoint = meta_->segmentInfos[rank_];
+        endpoint.nccl_unique_id = unique_id;
+        endpoint.nccl_unique_id_size = static_cast<uint32_t>(unique_id.size());
+    }
 
     // Control Plane Initialization
 
@@ -578,6 +626,42 @@ PGResult<void> MooncakeCommunicator::initialize(
     PG_TRY(
         agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(300)));
 
+    if (nccl_eligible) {
+        bool any_rank_selected_nccl = false;
+        bool every_rank_selected_nccl = true;
+        for (int local_rank = 0; local_rank < initial_size_; ++local_rank) {
+            const bool selected =
+                meta_->segmentInfos[local_rank].nccl_collectives_enabled;
+            any_rank_selected_nccl |= selected;
+            every_rank_selected_nccl &= selected;
+        }
+        PG_VALIDATE_STATE(
+            !any_rank_selected_nccl || every_rank_selected_nccl,
+            "GPU collective backend selection differs across group ranks");
+
+        if (every_rank_selected_nccl) {
+            PG_VALIDATE_STATE(nccl_collectives_,
+                              "local rank did not select NCCL collectives");
+            const auto& root_endpoint = meta_->segmentInfos[0];
+            PG_VALIDATE_STATE(
+                root_endpoint.nccl_unique_id_size == kNcclUniqueIdBytes,
+                "group root did not publish a valid NCCL bootstrap token");
+            PG_TRY(nccl_collectives_->initialize(root_endpoint.nccl_unique_id,
+                                                 rank_, initial_size_,
+                                                 device_index_));
+            bool initial_membership = getSize() == initial_size_;
+            for (int local_rank = 0; local_rank < max_group_size_;
+                 ++local_rank) {
+                initial_membership &= meta_->activeRanks[local_rank] ==
+                                      (local_rank < initial_size_);
+            }
+            if (!initial_membership) {
+                nccl_collectives_->disable(
+                    "membership changed during bootstrap");
+            }
+        }
+    }
+
     // Initialize all peer segment IDs from the LinkManager. Subsequent updates
     // (endpoint changes, disconnects) are handled by NotifyLinkRefreshed.
     for (int local = 0; local < max_group_size_; ++local) {
@@ -604,6 +688,13 @@ int MooncakeCommunicator::getSize() const {
         return initial_size_;
     }
     return meta_->activeSize.load(std::memory_order_acquire);
+}
+
+GpuCollectiveBackend MooncakeCommunicator::getGpuCollectiveBackend() const {
+    if (nccl_collectives_ && nccl_collectives_->isActive()) {
+        return GpuCollectiveBackend::Nccl;
+    }
+    return GpuCollectiveBackend::TransferEngine;
 }
 
 PGResult<void> MooncakeCommunicator::checkOpState(OpType op) const {
@@ -767,6 +858,12 @@ PGResult<void> MooncakeCommunicator::broadcastGpu(
     PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supports(datatype)) {
+        const void* input = is_root ? send_buffer : recv_buffer;
+        return nccl_collectives_->broadcast(input, recv_buffer, count, datatype,
+                                            root, stream);
+    }
     worker_->putTaskCuda(
         OpType::Broadcast, bytes, root, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
@@ -816,9 +913,14 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
     PG_TRY(auto bytes, getByteCount(count, datatype));
     PG_TRY(checkBuffer(send_buffer, bytes, "send buffer"));
     PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
-    PG_TRY(checkReduction(datatype, op, false));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supportsReduction(datatype, op)) {
+        return nccl_collectives_->allReduce(send_buffer, recv_buffer, count,
+                                            datatype, op, stream);
+    }
+    PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::AllReduce, bytes, 0, meta_, stream, failed_ranks_hint,
@@ -875,6 +977,11 @@ PGResult<void> MooncakeCommunicator::allGatherGpu(
     PG_TRY(checkBuffer(recv_buffer, send_bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supports(datatype)) {
+        return nccl_collectives_->allGather(send_buffer, recv_buffer, count,
+                                            datatype, stream);
+    }
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::AllGather, send_bytes, 0, meta_, stream, failed_ranks_hint,
@@ -937,9 +1044,14 @@ PGResult<void> MooncakeCommunicator::reduceScatterGpu(
     PG_TRY(auto recv_bytes, getByteCount(count, datatype));
     PG_TRY(checkBuffer(send_buffer, recv_bytes, "send buffer"));
     PG_TRY(checkBuffer(recv_buffer, recv_bytes, "receive buffer"));
-    PG_TRY(checkReduction(datatype, op, false));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supportsReduction(datatype, op)) {
+        return nccl_collectives_->reduceScatter(send_buffer, recv_buffer, count,
+                                                datatype, op, stream);
+    }
+    PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::ReduceScatter, recv_bytes, 0, meta_, stream, failed_ranks_hint,
@@ -1006,6 +1118,11 @@ PGResult<void> MooncakeCommunicator::allToAllGpu(
     PG_TRY(checkBuffer(recv_buffer, peer_bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supports(datatype)) {
+        return nccl_collectives_->allToAll(send_buffer, recv_buffer, count,
+                                           datatype, stream);
+    }
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::AllToAll, peer_bytes, 0, meta_, stream, failed_ranks_hint,
@@ -1048,6 +1165,9 @@ PGResult<void> MooncakeCommunicator::barrierGpu(
     PG_TRY(checkOpState(OpType::Barrier));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive()) {
+        return nccl_collectives_->barrier(stream);
+    }
     worker_->putTaskCuda(
         OpType::Barrier, kBarrierDummySize, 0, meta_, stream, failed_ranks_hint,
         [](void*, size_t, size_t, cudaStream_t) {},
@@ -1100,9 +1220,14 @@ PGResult<void> MooncakeCommunicator::reduceGpu(const void* send_buffer,
     if (is_root) {
         PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
     }
-    PG_TRY(checkReduction(datatype, op, false));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supportsReduction(datatype, op)) {
+        return nccl_collectives_->reduce(send_buffer, recv_buffer, count,
+                                         datatype, op, root, stream);
+    }
+    PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::Reduce, bytes, root, meta_, stream, failed_ranks_hint,
@@ -1170,6 +1295,11 @@ PGResult<void> MooncakeCommunicator::gatherGpu(const void* send_buffer,
     }
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supports(datatype)) {
+        return nccl_collectives_->gather(send_buffer, recv_buffer, count,
+                                         datatype, root, stream);
+    }
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::Gather, send_bytes, root, meta_, stream, failed_ranks_hint,
@@ -1236,6 +1366,11 @@ PGResult<void> MooncakeCommunicator::scatterGpu(
     }
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (nccl_collectives_ && nccl_collectives_->isActive() &&
+        nccl_collectives_->supports(datatype)) {
+        return nccl_collectives_->scatter(send_buffer, recv_buffer, count,
+                                          datatype, root, stream);
+    }
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::Scatter, recv_bytes, root, meta_, stream, failed_ranks_hint,
@@ -1260,9 +1395,9 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     if (is_shutdown_) return {};
     std::unique_ptr<GpuDeviceGuard> device_guard;
     const bool has_device_state =
-        !is_cpu_ &&
-        (active_ranks_mirror_stream_.has_value() || send_buffer_[0] ||
-         recv_buffer_[0] || worker_ || p2p_proxy_ || meta_);
+        !is_cpu_ && (active_ranks_mirror_stream_.has_value() ||
+                     send_buffer_[0] || recv_buffer_[0] || worker_ ||
+                     p2p_proxy_ || meta_ || nccl_collectives_);
     if (has_device_state) {
         device_guard = std::make_unique<GpuDeviceGuard>(device_index_);
     }
@@ -1272,6 +1407,8 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     // locally and at the Coordinator while worker tasks are draining because
     // their failure path may still call syncAfterFailure().
     if (isValidGroup()) agent_.detachCommunicator(meta_->group_id);
+
+    if (nccl_collectives_) nccl_collectives_->disable("communicator shutdown");
 
     // If we encounter any hung operations, don't release resources to avoid a
     // potential crash. Instead, allow those resources to leak and rely on the
@@ -1289,6 +1426,14 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     }
     // Phase 3: Device synchronization.
     if (has_device_state && !has_hung_operation) cudaDeviceSynchronize();
+
+    if (nccl_collectives_) {
+        if (has_hung_operation) {
+            (void)nccl_collectives_.release();
+        } else {
+            nccl_collectives_.reset();
+        }
+    }
 
     // Phase 4: Release resources.
     if (has_hung_operation && p2p_proxy_) p2p_proxy_->abandonResources();
@@ -1530,31 +1675,21 @@ void MooncakeCommunicator::applyViewUpdate(
         }
     }
 
-    std::vector<bool> previous_active_ranks(meta_->maxGroupSize);
-    for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
-        previous_active_ranks[local_rank] = meta_->activeRanks[local_rank];
-    }
-
-    // The execution mode determines the effective active ranks consumed by
-    // kernels. Isolated and Quiescing use a local-only mask; Normal follows the
-    // Coordinator's committed membership view.
+    // Compute the effective participant set before publishing it. NCCL
+    // communicators have fixed membership, so an authoritative participant or
+    // execution-mode change must abort NCCL before new operations can observe
+    // the updated view. The existing TE path then handles sparse membership.
+    std::vector<bool> next_active_ranks(meta_->maxGroupSize, false);
     switch (next_mode) {
         case CollectiveExtensionState::Isolated:
         case CollectiveExtensionState::Quiescing:
-            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
-                 ++local_rank) {
-                meta_->activeRanks[local_rank] = local_rank == rank_;
-            }
+            next_active_ranks[rank_] = true;
             break;
         case CollectiveExtensionState::Normal:
-            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
-                 ++local_rank) {
-                meta_->activeRanks[local_rank] = false;
-            }
             for (size_t local_rank = 0; local_rank < view.rank_order.size();
                  ++local_rank) {
                 const auto global_rank = view.rank_order[local_rank];
-                meta_->activeRanks[local_rank] =
+                next_active_ranks[local_rank] =
                     view.members[global_rank].isActive();
             }
             break;
@@ -1566,7 +1701,14 @@ void MooncakeCommunicator::applyViewUpdate(
     bool reset_task_count = next_mode != mode;
     for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
         reset_task_count |=
-            previous_active_ranks[local_rank] != meta_->activeRanks[local_rank];
+            meta_->activeRanks[local_rank] != next_active_ranks[local_rank];
+    }
+    if (reset_task_count && nccl_collectives_ &&
+        nccl_collectives_->isActive()) {
+        nccl_collectives_->disable("group membership changed");
+    }
+    for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
+        meta_->activeRanks[local_rank] = next_active_ranks[local_rank];
     }
     if (reset_task_count) meta_->taskCount = 0;
 

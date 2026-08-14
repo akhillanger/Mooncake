@@ -40,6 +40,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend", choices=["mooncake", "mooncake-cpu", "nccl", "gloo"]
     )
+    parser.add_argument(
+        "--mooncake-gpu-collective-backend",
+        choices=["auto", "transfer_engine", "nccl"],
+        default="auto",
+        help="GPU collective data plane used when --backend=mooncake",
+    )
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("-b", "--minbytes", type=str, default="32M")
     parser.add_argument("-e", "--maxbytes", type=str, default="32M")
@@ -85,7 +91,7 @@ def _sync_ranks(device: torch.device) -> None:
     if device.type == "cpu":
         dist.barrier()
         return
-    # mooncake GPU backend does not support barrier; use all_reduce as a sync primitive.
+    # Use all-reduce as a synchronization primitive across every GPU backend.
     token = torch.zeros(1, device=device, dtype=torch.int32)
     dist.all_reduce(token, op=dist.ReduceOp.SUM)
     torch.cuda.synchronize(device)
@@ -444,11 +450,18 @@ def _run_worker(local_rank: int, args: argparse.Namespace) -> None:
         raise ValueError("--device=cpu requires --backend=mooncake-cpu or gloo")
 
     backend = args.backend
+    pg_module = None
     if backend in ("mooncake", "mooncake-cpu"):
         try:
             import mooncake.pg as pg
 
+            pg_module = pg
             configure_mooncake_device_filter(pg)
+            host_ip = os.getenv("MOONCAKE_PG_HOST_IP")
+            if host_ip:
+                pg.set_host_ip(host_ip)
+            if backend == "mooncake":
+                pg.set_gpu_collective_backend(args.mooncake_gpu_collective_backend)
         except (
             Exception
         ) as exc:  # pragma: no cover - import-time failure should be explicit
@@ -465,14 +478,20 @@ def _run_worker(local_rank: int, args: argparse.Namespace) -> None:
         world_size = args.ngpus
 
     if args.device == "cuda":
-        if torch.cuda.device_count() < world_size:
-            raise RuntimeError("Requested more ranks than available CUDA devices")
+        if local_rank >= torch.cuda.device_count():
+            raise RuntimeError(f"Local rank {local_rank} has no visible CUDA device")
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
     else:
         device = torch.device("cpu")
 
     _init_dist(rank, world_size, backend)
+    if rank == 0 and backend == "mooncake":
+        effective_backend = pg_module.get_gpu_collective_backend(dist.group.WORLD)
+        print(
+            f"# Mooncake GPU collective backend: {effective_backend}",
+            flush=True,
+        )
 
     if args.datatype == "all":
         dtype_list = list_supported_dtypes(device)

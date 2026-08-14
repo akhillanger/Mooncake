@@ -74,8 +74,10 @@ if(BUILD_UNIT_TESTS)
 endif()
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
-option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend" OFF)
+option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
+       OFF)
 option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
+option(USE_NCCL_PG "option for enabling NCCL collectives in Mooncake PG" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
@@ -97,9 +99,10 @@ option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
-option(USE_TPU
-       "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
-       OFF)
+option(
+  USE_TPU
+  "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
+  OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 
 if(USE_UB)
@@ -207,7 +210,7 @@ if(USE_MNNVL)
   message(STATUS "Multi-Node NVLink support is enabled")
 endif()
 
-if (USE_VRAM_SEGMENT)
+if(USE_VRAM_SEGMENT)
   set(USE_CUDA ON)
   add_compile_definitions(USE_VRAM_SEGMENT)
   message(STATUS "VRAM SEGMENT is ON")
@@ -225,10 +228,11 @@ if(USE_CUDA)
   link_directories(${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_LIBRARY_DIR}/stubs)
 endif()
 
-if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
+if(USE_NCCL_DEVICE
+   OR USE_NCCL_HOST
+   OR USE_NCCL_PG)
   if(NOT USE_CUDA)
-    message(FATAL_ERROR
-      "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
+    message(FATAL_ERROR "NCCL backends require USE_CUDA=ON")
   endif()
   list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
   find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
@@ -236,14 +240,22 @@ endif()
 
 if(USE_NCCL_DEVICE)
   add_compile_definitions(USE_NCCL_DEVICE)
-  message(STATUS
-    "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
+  message(
+    STATUS
+      "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
 endif()
 
 if(USE_NCCL_HOST)
   add_compile_definitions(USE_NCCL_HOST)
-  message(STATUS
-    "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
+  message(
+    STATUS "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_NCCL_PG)
+  add_compile_definitions(USE_NCCL_PG)
+  message(
+    STATUS
+      "NCCL Mooncake PG collectives are enabled (NCCL ${NCCLDevice_VERSION})")
 endif()
 
 if(USE_SUPA)

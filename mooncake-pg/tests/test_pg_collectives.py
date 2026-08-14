@@ -1,7 +1,9 @@
+import os
 import unittest
 
 import torch
 import torch.distributed as dist
+from mooncake import pg
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -45,7 +47,9 @@ def _collective_payload(
         return {"value": int(tensor.cpu().item())}
 
     if case_name == "broadcast":
-        tensor = torch.tensor([111 if rank == 0 else -1], dtype=torch.int32, device=device)
+        tensor = torch.tensor(
+            [111 if rank == 0 else -1], dtype=torch.int32, device=device
+        )
         dist.broadcast(tensor, src=0)
         return {"value": int(tensor.cpu().item())}
 
@@ -72,7 +76,23 @@ def _collective_payload(
         if hasattr(dist, "reduce_scatter_tensor"):
             dist.reduce_scatter_tensor(output, input_buf, op=dist.ReduceOp.SUM)
         else:
-            dist.reduce_scatter(output, list(input_buf.chunk(world_size)), op=dist.ReduceOp.SUM)
+            dist.reduce_scatter(
+                output, list(input_buf.chunk(world_size)), op=dist.ReduceOp.SUM
+            )
+        return {"value": output.cpu().tolist()}
+
+    if case_name in ("alltoall", "alltoall_in_place"):
+        input_buf = torch.tensor(
+            [rank * 100 + peer for peer in range(world_size)],
+            dtype=torch.int32,
+            device=device,
+        )
+        output = (
+            input_buf
+            if case_name == "alltoall_in_place"
+            else torch.empty_like(input_buf)
+        )
+        dist.all_to_all_single(output, input_buf)
         return {"value": output.cpu().tolist()}
 
     if case_name == "barrier":
@@ -126,9 +146,24 @@ def _collective_worker(
     ctx.record_result(payload)
 
 
+def _gpu_backend_selection_worker(ctx: MooncakePGWorkerContext, backend: str) -> None:
+    pg.set_gpu_collective_backend(backend)
+    ctx.init_group()
+    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=ctx.device)
+    dist.all_reduce(tensor)
+    ctx.record_result(
+        {
+            "backend": pg.get_gpu_collective_backend(ctx.get_backend()),
+            "value": int(tensor.cpu().item()),
+        }
+    )
+
+
 class _CollectiveTestMixin:
     def test_world_init_without_pg_options(self) -> None:
-        rows = self.spawn_backend_and_collect(_collective_worker, "world_init_without_pg_options")
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "world_init_without_pg_options"
+        )
         self.assert_all_ok(rows)
 
         expected = sum(range(1, self.world_size + 1))
@@ -156,9 +191,11 @@ class _CollectiveTestMixin:
             self.assertEqual(row["value"], expected)
 
     def test_allreduce_product(self) -> None:
-        rows = self.spawn_backend_and_collect(_collective_worker, "allreduce", "product")
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "allreduce", "product"
+        )
         self.assert_all_ok(rows)
-        expected = 2 ** self.world_size
+        expected = 2**self.world_size
         for row in rows:
             self.assertEqual(row["value"], expected)
 
@@ -169,7 +206,9 @@ class _CollectiveTestMixin:
             self.assertEqual(row["value"], 111)
 
     def test_all_gather_into_tensor(self) -> None:
-        rows = self.spawn_backend_and_collect(_collective_worker, "all_gather_into_tensor")
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "all_gather_into_tensor"
+        )
         self.assert_all_ok(rows)
         expected = list(range(self.world_size))
         for row in rows:
@@ -187,8 +226,24 @@ class _CollectiveTestMixin:
         self.assert_all_ok(rows)
         for row in rows:
             rank = row["rank"]
-            expected = self.world_size * (self.world_size * (self.world_size - 1) // 2 + rank)
+            expected = self.world_size * (
+                self.world_size * (self.world_size - 1) // 2 + rank
+            )
             self.assertEqual(row["value"], [expected])
+
+    def _check_alltoall(self, case_name: str) -> None:
+        rows = self.spawn_backend_and_collect(_collective_worker, case_name)
+        self.assert_all_ok(rows)
+        for row in rows:
+            rank = row["rank"]
+            expected = [peer * 100 + rank for peer in range(self.world_size)]
+            self.assertEqual(row["value"], expected)
+
+    def test_alltoall(self) -> None:
+        self._check_alltoall("alltoall")
+
+    def test_alltoall_in_place(self) -> None:
+        self._check_alltoall("alltoall_in_place")
 
     def test_barrier(self) -> None:
         rows = self.spawn_backend_and_collect(_collective_worker, "barrier")
@@ -222,11 +277,33 @@ class TestMooncakePGCollectivesCPU(_CollectiveTestMixin, MooncakePGCPUBackendTes
     world_size = 4
 
 
-class TestMooncakePGCollectivesCUDA(_CollectiveTestMixin, MooncakePGCUDABackendTestCase):
+class TestMooncakePGCollectivesCUDA(
+    _CollectiveTestMixin, MooncakePGCUDABackendTestCase
+):
     world_size = 2
 
+    def _check_gpu_backend_selection(self, backend: str) -> None:
+        rows = self.spawn_backend_and_collect(_gpu_backend_selection_worker, backend)
+        self.assert_all_ok(rows)
+        expected = sum(range(1, self.world_size + 1))
+        for row in rows:
+            self.assertEqual(row["backend"], backend)
+            self.assertEqual(row["value"], expected)
 
-class TestMooncakePGCollectivesMUSA(_CollectiveTestMixin, MooncakePGMUSABackendTestCase):
+    def test_transfer_engine_backend_selection(self) -> None:
+        self._check_gpu_backend_selection("transfer_engine")
+
+    @unittest.skipUnless(
+        os.getenv("MOONCAKE_PGTEST_NCCL") == "1",
+        "requires a USE_NCCL_PG build",
+    )
+    def test_nccl_backend_selection(self) -> None:
+        self._check_gpu_backend_selection("nccl")
+
+
+class TestMooncakePGCollectivesMUSA(
+    _CollectiveTestMixin, MooncakePGMUSABackendTestCase
+):
     world_size = 2
 
 
