@@ -84,6 +84,14 @@ enum class ReduceOp : uint8_t {
     Max = 4,
 };
 
+// Process-wide selection for GPU collective execution. Point-to-point and CPU
+// operations continue to use Transfer Engine for every selection.
+enum class GpuCollectiveBackend : uint8_t {
+    Auto = 0,
+    TransferEngine = 1,
+    Nccl = 2,
+};
+
 class WorkCompletion {
    public:
     explicit WorkCompletion(std::shared_future<void> completion)

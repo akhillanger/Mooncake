@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -214,6 +215,21 @@ int64_t getCurrentEpoch(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     return static_cast<int64_t>(mooncakeBackend->getCurrentEpoch());
 }
 
+std::string getGpuCollectiveBackend(
+    c10::intrusive_ptr<c10d::ProcessGroup> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    switch (mooncakeBackend->getGpuCollectiveBackend()) {
+        case mooncakePgGpuCollectiveTransferEngine:
+            return "transfer_engine";
+        case mooncakePgGpuCollectiveNccl:
+            return "nccl";
+        case mooncakePgGpuCollectiveAuto:
+            TORCH_CHECK(false, "Mooncake communicator returned auto backend");
+    }
+    TORCH_CHECK(false, "Mooncake communicator returned invalid backend");
+}
+
 /// Python-facing wrapper that extracts the raw TransferEngine* from a
 /// mooncake.engine.TransferEngine Python object and makes it the process-wide
 /// engine for all MooncakeBackend instances.  The caller must ensure the
@@ -262,6 +278,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         checkResult(mooncakePgContextSetHostIp(getContext(), host.c_str()),
                     "mooncakePgContextSetHostIp");
     });
+    m.def(
+        "set_gpu_collective_backend",
+        [](const std::string& name) {
+            mooncakePgGpuCollectiveBackend_t backend;
+            if (name == "auto") {
+                backend = mooncakePgGpuCollectiveAuto;
+            } else if (name == "transfer_engine") {
+                backend = mooncakePgGpuCollectiveTransferEngine;
+            } else if (name == "nccl") {
+                backend = mooncakePgGpuCollectiveNccl;
+            } else {
+                throw std::invalid_argument(
+                    "GPU collective backend must be auto, transfer_engine, "
+                    "or nccl");
+            }
+            checkResult(
+                mooncakePgContextSetGpuCollectiveBackend(getContext(), backend),
+                "mooncakePgContextSetGpuCollectiveBackend");
+        },
+        py::arg("backend"),
+        "Select the process-wide Mooncake GPU collective data plane before "
+        "creating a process group.");
     m.def(
         "set_collective_timeout_us",
         [](size_t us) {
@@ -320,6 +358,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_current_epoch", &getCurrentEpoch, py::arg("backend"),
           "Get the current GroupView epoch (monotonically increasing on "
           "membership changes).");
+    m.def("get_gpu_collective_backend", &getGpuCollectiveBackend,
+          py::arg("backend"),
+          "Return the active GPU collective data plane for a process group.");
 
     m.def(
         "sync_after_failure",

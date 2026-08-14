@@ -251,6 +251,15 @@ class MooncakeBackendShim final : public ::c10d::Backend {
         return owner_->alltoall(outputTensors, inputTensors, opts);
     }
 
+    c10::intrusive_ptr<c10d::Work> alltoall_base(
+        at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+        std::vector<int64_t>& outputSplitSizes,
+        std::vector<int64_t>& inputSplitSizes,
+        const c10d::AllToAllOptions& opts) override {
+        return owner_->alltoall_base(outputBuffer, inputBuffer,
+                                     outputSplitSizes, inputSplitSizes, opts);
+    }
+
     c10::intrusive_ptr<c10d::Work> reduce(
         std::vector<at::Tensor>& tensors,
         const c10d::ReduceOptions& opts) override {
@@ -605,6 +614,39 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
         tensorCount(reference), tensorType(reference));
 }
 
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall_base(
+    at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+    std::vector<int64_t>& outputSplitSizes,
+    std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions&) {
+    validateSingleBufferTensors(outputBuffer, inputBuffer,
+                                isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
+    const int active_size = getSize();
+    TORCH_CHECK(active_size > 0, "all-to-all requires a non-empty group");
+    TORCH_CHECK(inputBuffer.numel() == outputBuffer.numel(),
+                "equal-split all-to-all requires equal input/output sizes");
+    TORCH_CHECK(inputBuffer.numel() % active_size == 0,
+                "all-to-all element count must be divisible by group size");
+    const int64_t peer_count = inputBuffer.numel() / active_size;
+    auto validate_splits = [&](const std::vector<int64_t>& splits,
+                               const char* name) {
+        if (splits.empty()) return;
+        TORCH_CHECK(splits.size() == static_cast<size_t>(active_size), name,
+                    " split count must match active group size");
+        TORCH_CHECK(
+            std::all_of(splits.begin(), splits.end(),
+                        [=](int64_t count) { return count == peer_count; }),
+            "Mooncake PG currently supports equal-split all-to-all ", "only");
+    };
+    validate_splits(inputSplitSizes, "input");
+    validate_splits(outputSplitSizes, "output");
+
+    return launchCollective<mooncakePgAllToAllCpu, mooncakePgAllToAllGpu>(
+        c10d::OpType::ALLTOALL_BASE, "mooncakePgAllToAll", inputBuffer,
+        {inputBuffer, outputBuffer}, {}, inputBuffer.data_ptr(),
+        outputBuffer.data_ptr(), static_cast<size_t>(peer_count),
+        tensorType(inputBuffer));
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions&) {
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
@@ -773,6 +815,15 @@ uint64_t MooncakeBackend::getCurrentEpoch() const {
     checkResult(mooncakePgCommGetEpoch(comm_, &epoch),
                 "mooncakePgCommGetEpoch");
     return epoch;
+}
+
+mooncakePgGpuCollectiveBackend_t MooncakeBackend::getGpuCollectiveBackend()
+    const {
+    mooncakePgGpuCollectiveBackend_t backend =
+        mooncakePgGpuCollectiveTransferEngine;
+    checkResult(mooncakePgCommGetGpuCollectiveBackend(comm_, &backend),
+                "mooncakePgCommGetGpuCollectiveBackend");
+    return backend;
 }
 
 mooncakePgSyncAfterFailureResponse_t MooncakeBackend::syncAfterFailure() {

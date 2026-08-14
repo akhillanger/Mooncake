@@ -24,6 +24,8 @@
 
 namespace mooncake {
 
+class NcclCollectiveExecutor;
+
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
 
@@ -40,6 +42,7 @@ struct MooncakePGContext {
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
+    GpuCollectiveBackend gpu_collective_backend = GpuCollectiveBackend::Auto;
 
     std::unique_ptr<TransferEngine> owned_engine =
         std::make_unique<TransferEngine>(true);
@@ -69,6 +72,7 @@ struct MooncakePGContext {
     PGResult<void> connectCoordinator(const std::string& coordinator_address);
     PGResult<void> setHostIp(std::string value);
     PGResult<void> setExternalEngine(TransferEngine* transfer_engine);
+    PGResult<void> setGpuCollectiveBackend(GpuCollectiveBackend backend);
     PGResult<void> setDeviceFilter(std::vector<std::string> filters);
     PGResult<void> setCollectiveTimeout(size_t timeout_us);
     PGResult<void> setP2PTimeout(int64_t timeout_us);
@@ -121,6 +125,7 @@ class MooncakeCommunicator {
     int getSize() const;
     int getMaxGroupSize() const { return max_group_size_; }
     bool isCpu() const { return is_cpu_; }
+    GpuCollectiveBackend getGpuCollectiveBackend() const;
 
     PGResult<std::unique_ptr<WorkCompletion>> sendCpu(
         const void* buffer, size_t count, DataType datatype, int peer,
@@ -308,6 +313,9 @@ class MooncakeCommunicator {
     // Created by P2PDeviceWorkerManager and shared between communicators on the
     // same device.
     std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
+
+    // Optional NCCL executor for GPU collectives. P2P remains on TE.
+    std::unique_ptr<NcclCollectiveExecutor> nccl_collectives_;
 };
 
 }  // namespace mooncake
