@@ -1,8 +1,10 @@
+import os
 import unittest
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from mooncake import pg
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -78,6 +80,20 @@ def _collective_payload(
             dist.reduce_scatter(
                 output, list(input_buf.chunk(world_size)), op=dist.ReduceOp.SUM
             )
+        return {"value": output.cpu().tolist()}
+
+    if case_name in ("alltoall", "alltoall_in_place"):
+        input_buf = torch.tensor(
+            [rank * 100 + peer for peer in range(world_size)],
+            dtype=torch.int32,
+            device=device,
+        )
+        output = (
+            input_buf
+            if case_name == "alltoall_in_place"
+            else torch.empty_like(input_buf)
+        )
+        dist.all_to_all_single(output, input_buf)
         return {"value": output.cpu().tolist()}
 
     if case_name == "barrier":
@@ -167,6 +183,19 @@ def _async_ops_on_independent_streams_worker(
     )
 
 
+def _gpu_backend_selection_worker(ctx: MooncakePGWorkerContext, backend: str) -> None:
+    pg.set_gpu_collective_backend(backend)
+    ctx.init_group()
+    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=ctx.device)
+    dist.all_reduce(tensor)
+    ctx.record_result(
+        {
+            "backend": pg.get_gpu_collective_backend(ctx.get_backend()),
+            "value": int(tensor.cpu().item()),
+        }
+    )
+
+
 class _CollectiveTestMixin:
     def test_world_init_without_pg_options(self) -> None:
         rows = self.spawn_backend_and_collect(
@@ -239,6 +268,20 @@ class _CollectiveTestMixin:
             )
             self.assertEqual(row["value"], [expected])
 
+    def _check_alltoall(self, case_name: str) -> None:
+        rows = self.spawn_backend_and_collect(_collective_worker, case_name)
+        self.assert_all_ok(rows)
+        for row in rows:
+            rank = row["rank"]
+            expected = [peer * 100 + rank for peer in range(self.world_size)]
+            self.assertEqual(row["value"], expected)
+
+    def test_alltoall(self) -> None:
+        self._check_alltoall("alltoall")
+
+    def test_alltoall_in_place(self) -> None:
+        self._check_alltoall("alltoall_in_place")
+
     def test_barrier(self) -> None:
         rows = self.spawn_backend_and_collect(_collective_worker, "barrier")
         self.assert_all_ok(rows)
@@ -292,6 +335,24 @@ class TestMooncakePGCollectivesCUDA(
             rank_one["rank_zero_submitted_both"],
             "rank 0 blocked before submitting both async operations",
         )
+
+    def _check_gpu_backend_selection(self, backend: str) -> None:
+        rows = self.spawn_backend_and_collect(_gpu_backend_selection_worker, backend)
+        self.assert_all_ok(rows)
+        expected = sum(range(1, self.world_size + 1))
+        for row in rows:
+            self.assertEqual(row["backend"], backend)
+            self.assertEqual(row["value"], expected)
+
+    def test_transfer_engine_backend_selection(self) -> None:
+        self._check_gpu_backend_selection("transfer_engine")
+
+    @unittest.skipUnless(
+        os.getenv("MOONCAKE_PGTEST_NCCL") == "1",
+        "requires a USE_NCCL_PG build",
+    )
+    def test_nccl_backend_selection(self) -> None:
+        self._check_gpu_backend_selection("nccl")
 
 
 class TestMooncakePGCollectivesMUSA(

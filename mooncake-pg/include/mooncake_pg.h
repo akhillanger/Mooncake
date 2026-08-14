@@ -80,6 +80,12 @@ typedef enum mooncakePgIdResolvePolicy {
     mooncakePgIdResolveAttachOrExtend = 1,
 } mooncakePgIdResolvePolicy_t;
 
+typedef enum mooncakePgGpuCollectiveBackend {
+    mooncakePgGpuCollectiveAuto = 0,
+    mooncakePgGpuCollectiveTransferEngine = 1,
+    mooncakePgGpuCollectiveNccl = 2,
+} mooncakePgGpuCollectiveBackend_t;
+
 typedef struct mooncakePgCommConfig {
     size_t structSize;
     unsigned int magic;
@@ -165,6 +171,8 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgContextSetHostIp(mooncakePgContext_t context, const char* hostIp);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetTransferEngine(
     mooncakePgContext_t context, void* transferEngine);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetGpuCollectiveBackend(
+    mooncakePgContext_t context, mooncakePgGpuCollectiveBackend_t backend);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetDeviceFilter(
     mooncakePgContext_t context, const char* const* filters,
     size_t filterCount);
@@ -189,6 +197,8 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommGetSize(mooncakePgComm_t comm, int* size);
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommGetMaxGroupSize(mooncakePgComm_t comm, int* maxGroupSize);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommGetGpuCollectiveBackend(
+    mooncakePgComm_t comm, mooncakePgGpuCollectiveBackend_t* backend);
 
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgBroadcastGpu(const void* sendBuffer, void* recvBuffer, size_t count,

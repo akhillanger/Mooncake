@@ -1,6 +1,8 @@
 #ifndef MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 #define MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -25,6 +27,7 @@ using GroupId = std::string;
 
 constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
+constexpr std::size_t kNcclUniqueIdBytes = 128;
 
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.
@@ -71,6 +74,14 @@ struct GroupEndpointInfo {
     // p2p
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
+
+    // Every rank publishes whether it selected NCCL so a mixed configuration
+    // fails before communicator initialization instead of hanging. Rank zero
+    // also publishes the bootstrap token. Keeping both in the existing endpoint
+    // exchange avoids introducing a second rendezvous protocol.
+    bool nccl_collectives_enabled = false;
+    std::array<uint8_t, kNcclUniqueIdBytes> nccl_unique_id{};
+    uint32_t nccl_unique_id_size = 0;
 
     bool operator==(const GroupEndpointInfo&) const = default;
 };

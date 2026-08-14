@@ -389,6 +389,29 @@ mooncakePgResult_t mooncakePgContextSetTransferEngine(
     });
 }
 
+mooncakePgResult_t mooncakePgContextSetGpuCollectiveBackend(
+    mooncakePgContext_t context, mooncakePgGpuCollectiveBackend_t backend) {
+    return asCApiResult([&]() -> PGResult<void> {
+        PG_VALIDATE_ARG(context && context->impl, "invalid context");
+        GpuCollectiveBackend converted;
+        switch (backend) {
+            case mooncakePgGpuCollectiveAuto:
+                converted = GpuCollectiveBackend::Auto;
+                break;
+            case mooncakePgGpuCollectiveTransferEngine:
+                converted = GpuCollectiveBackend::TransferEngine;
+                break;
+            case mooncakePgGpuCollectiveNccl:
+                converted = GpuCollectiveBackend::Nccl;
+                break;
+            default:
+                return makePGError(PGErrorCode::InvalidArgument,
+                                   "invalid GPU collective backend");
+        }
+        return context->impl->setGpuCollectiveBackend(converted);
+    });
+}
+
 mooncakePgResult_t mooncakePgContextSetDeviceFilter(mooncakePgContext_t context,
                                                     const char* const* filters,
                                                     size_t filter_count) {
@@ -493,6 +516,25 @@ mooncakePgResult_t mooncakePgCommGetMaxGroupSize(mooncakePgComm_t comm,
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(max_group_size, "maximum group-size output is null");
         *max_group_size = comm->impl->getMaxGroupSize();
+        return {};
+    });
+}
+
+mooncakePgResult_t mooncakePgCommGetGpuCollectiveBackend(
+    mooncakePgComm_t comm, mooncakePgGpuCollectiveBackend_t* backend) {
+    return asCApiResult([&]() -> PGResult<void> {
+        PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
+        PG_VALIDATE_ARG(backend, "GPU collective backend output is null");
+        switch (comm->impl->getGpuCollectiveBackend()) {
+            case GpuCollectiveBackend::TransferEngine:
+                *backend = mooncakePgGpuCollectiveTransferEngine;
+                break;
+            case GpuCollectiveBackend::Nccl:
+                *backend = mooncakePgGpuCollectiveNccl;
+                break;
+            case GpuCollectiveBackend::Auto:
+                PG_ASSERT(false, "communicator returned unresolved backend");
+        }
         return {};
     });
 }

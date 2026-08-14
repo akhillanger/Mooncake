@@ -131,6 +131,11 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::vector<at::Tensor>& outputTensors,
         std::vector<at::Tensor>& inputTensors,
         const c10d::AllToAllOptions& opts) override;
+    c10::intrusive_ptr<c10d::Work> alltoall_base(
+        at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+        std::vector<int64_t>& outputSplitSizes,
+        std::vector<int64_t>& inputSplitSizes,
+        const c10d::AllToAllOptions& opts) override;
     c10::intrusive_ptr<c10d::Work> barrier(
         const c10d::BarrierOptions& opts) override;
     c10::intrusive_ptr<c10d::Work> reduce(
@@ -155,6 +160,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     mooncakePgProposalResponse_t deactivateRanks(const std::vector<int>& ranks);
     void joinGroup();
     uint64_t getCurrentEpoch() const;
+    mooncakePgGpuCollectiveBackend_t getGpuCollectiveBackend() const;
     mooncakePgSyncAfterFailureResponse_t syncAfterFailure();
 
    private:
