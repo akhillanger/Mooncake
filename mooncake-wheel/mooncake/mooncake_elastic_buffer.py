@@ -354,6 +354,7 @@ class ElasticBuffer:
             self.transport,
             nccl_unique_id,
         )
+        self.kernel_mode = "jit" if self.runtime.using_nccl_jit() else "aot"
         # NCCL's LSA team is the transport authority for the local domain; it
         # may differ from the CUDA-visible-device heuristic used before native
         # initialization. Keep the public topology fields in sync with the

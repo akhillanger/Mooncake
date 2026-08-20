@@ -2,6 +2,8 @@
 #include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <elastic/mooncake_ep_elastic_layout.cuh>
 
+#include "mooncake_ep_elastic_jit.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -229,6 +231,7 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     int64_t timeout_cycles) const {
     ElasticLaunchContext ctx;
     ctx.device_id = device_id_;
+    ctx.use_nccl_jit = config_.use_nccl_jit;
     const auto workspace_bytes = elastic_workspace_num_bytes();
     const auto scratch_bytes = elastic_atomic_scratch_num_bytes();
 
@@ -349,6 +352,10 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
     config_.num_topk = num_topk;
     config_.use_fp8_dispatch = use_fp8_dispatch;
     config_.deterministic = deterministic;
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+    config_.use_nccl_jit =
+        transport_ == "nccl" && elastic::jit::requested_by_environment();
+#endif
     config_.allow_hybrid_mode = allow_hybrid_mode;
     config_.allow_multiple_reduction = allow_multiple_reduction;
     config_.prefer_overlap_with_compute = prefer_overlap_with_compute;

@@ -12,6 +12,8 @@
 #include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <transport/device/comm_device.cuh>
 
+#include "mooncake_ep_elastic_jit.h"
+
 namespace mooncake {
 namespace {
 
@@ -547,6 +549,43 @@ void launch_mooncake_elastic_dispatch_backend(
                                 num_experts, num_notify_warps,
                                 hybrid_dispatch_warps));
 
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+        if constexpr (Ops::kIsNccl) {
+            if (ctx.use_nccl_jit) {
+                if (expert_alignment != 1 || do_cpu_sync ||
+                    num_channels_per_sm != Ops::kNumHybridForwardWarps ||
+                    token_metadata_at_forward == nullptr) {
+                    throw std::invalid_argument(
+                        "Mooncake EP NCCL JIT received an unsupported hybrid "
+                        "dispatch configuration");
+                }
+                elastic::jit::DispatchSpec spec;
+                spec.hidden_bytes = hidden * elem_size;
+                spec.num_sf_packs = num_sf_packs;
+                spec.num_max_tokens_per_rank = num_max_tokens_per_rank;
+                spec.num_experts = num_experts;
+                spec.num_topk = num_topk;
+                spec.num_sms = num_sms;
+                spec.num_notify_warps = num_notify_warps;
+                spec.num_threads = hybrid_threads;
+                spec.smem_bytes = hybrid_smem_bytes;
+                spec.num_scaleout_ranks = ctx.num_scaleout_ranks;
+                spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
+                spec.reuse_slot_indices = cached_mode;
+                elastic::jit::launch_dispatch(
+                    spec, x, sf, topk_idx, topk_weights, copied_topk_idx,
+                    cumulative_local_expert_recv_stats,
+                    psum_num_recv_tokens_per_scaleup_rank,
+                    psum_num_recv_tokens_per_expert, dst_buffer_slot_idx,
+                    token_metadata_at_forward, num_tokens, sf_token_stride,
+                    sf_hidden_stride, comm_ctx, ctx.buffer, ctx.workspace,
+                    ctx.mapped_host_workspace, ctx.scaleout_rank_idx,
+                    ctx.scaleup_rank_idx, stream);
+                return;
+            }
+        }
+#endif
+
 #define LAUNCH_HYBRID_DISPATCH(HB, SFP, E, K, M, S, SO, SU)                    \
         do {                                                                   \
             constexpr int kHiddenBytes = (HB);                                 \
@@ -642,6 +681,40 @@ void launch_mooncake_elastic_dispatch_backend(
 #undef TRY_HYBRID_DISPATCH
 #undef TRY_HYBRID_DISPATCH_TYPED
 #undef LAUNCH_HYBRID_DISPATCH
+    }
+#endif
+
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+    if constexpr (Ops::kIsNccl) {
+        if (ctx.use_nccl_jit) {
+            if (expert_alignment != 1 || do_cpu_sync) {
+                throw std::invalid_argument(
+                    "Mooncake EP NCCL JIT received an unsupported dispatch "
+                    "configuration");
+            }
+            elastic::jit::DispatchSpec spec;
+            spec.hidden_bytes = hidden * elem_size;
+            spec.num_sf_packs = num_sf_packs;
+            spec.num_max_tokens_per_rank = num_max_tokens_per_rank;
+            spec.num_experts = num_experts;
+            spec.num_topk = num_topk;
+            spec.num_sms = num_sms;
+            spec.num_notify_warps = num_notify_warps;
+            spec.num_threads = num_threads;
+            spec.smem_bytes = smem_bytes;
+            spec.num_scaleout_ranks = 1;
+            spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
+            spec.reuse_slot_indices = reuse_slot_indices;
+            elastic::jit::launch_dispatch(
+                spec, x, sf, topk_idx, topk_weights, copied_topk_idx,
+                cumulative_local_expert_recv_stats,
+                psum_num_recv_tokens_per_scaleup_rank,
+                psum_num_recv_tokens_per_expert, dst_buffer_slot_idx,
+                token_metadata_at_forward, num_tokens, sf_token_stride,
+                sf_hidden_stride, comm_ctx, ctx.buffer, ctx.workspace,
+                ctx.mapped_host_workspace, 0, ctx.scaleup_rank_idx, stream);
+            return;
+        }
     }
 #endif
 
@@ -965,6 +1038,41 @@ void* launch_mooncake_elastic_combine_backend(
             num_smem_bytes,
             combine_smem_bytes(hidden, num_topk, hybrid_combine_warps));
 
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+        if constexpr (Ops::kIsNccl) {
+            if (ctx.use_nccl_jit) {
+                if (!allow_multiple_reduction || use_expanded_layout ||
+                    num_channels != hybrid_num_channels<Ops>(num_sms) ||
+                    token_metadata_at_forward == nullptr ||
+                    channel_linked_list == nullptr) {
+                    throw std::invalid_argument(
+                        "Mooncake EP NCCL JIT received an unsupported hybrid "
+                        "combine configuration");
+                }
+                elastic::jit::CombineSpec spec;
+                spec.hidden = hidden;
+                spec.num_max_tokens_per_rank = num_max_tokens_per_rank;
+                spec.num_experts = num_experts;
+                spec.num_topk = num_topk;
+                spec.num_sms = num_sms;
+                spec.num_threads = hybrid_threads;
+                spec.smem_bytes = hybrid_smem_bytes;
+                spec.num_scaleout_ranks = ctx.num_scaleout_ranks;
+                spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
+                elastic::jit::launch_combine(
+                    spec, x, topk_weights, src_metadata,
+                    psum_num_recv_tokens_per_scaleup_rank,
+                    token_metadata_at_forward, channel_linked_list,
+                    num_reduced_tokens, comm_ctx, ctx.buffer, ctx.workspace,
+                    ctx.scaleout_rank_idx, ctx.scaleup_rank_idx, stream);
+                return hybrid_combine_reduce_buffer_ptr(
+                    ctx.buffer, hidden, num_topk, num_max_tokens_per_rank,
+                    ctx.num_scaleout_ranks, ctx.num_scaleup_ranks,
+                    allow_multiple_reduction);
+            }
+        }
+#endif
+
 #define LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU)                           \
         do {                                                                   \
             auto kernel = elastic::hybrid_combine_impl<Ops,                    \
@@ -1007,6 +1115,35 @@ void* launch_mooncake_elastic_combine_backend(
 #endif
 
     (void)num_channels;
+
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+    if constexpr (Ops::kIsNccl) {
+        if (ctx.use_nccl_jit) {
+            if (!allow_multiple_reduction || use_expanded_layout) {
+                throw std::invalid_argument(
+                    "Mooncake EP NCCL JIT received an unsupported combine "
+                    "configuration");
+            }
+            elastic::jit::CombineSpec spec;
+            spec.hidden = hidden;
+            spec.num_max_tokens_per_rank = num_max_tokens_per_rank;
+            spec.num_experts = num_experts;
+            spec.num_topk = num_topk;
+            spec.num_sms = num_sms;
+            spec.num_threads = num_threads;
+            spec.smem_bytes = smem_bytes;
+            spec.num_scaleout_ranks = 1;
+            spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
+            elastic::jit::launch_combine(
+                spec, x, topk_weights, src_metadata,
+                psum_num_recv_tokens_per_scaleup_rank,
+                token_metadata_at_forward, channel_linked_list,
+                num_reduced_tokens, comm_ctx, ctx.buffer, ctx.workspace, 0,
+                ctx.scaleup_rank_idx, stream);
+            return ctx.buffer;
+        }
+    }
+#endif
 
 #define LAUNCH_COMBINE(H, E, K, M, S, R)                                       \
     do {                                                                       \

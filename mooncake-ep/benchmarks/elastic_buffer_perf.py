@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
         help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA.",
     )
     parser.add_argument(
+        "--kernel-mode",
+        choices=("aot", "jit"),
+        default="aot",
+        help=(
+            "NCCL elastic-kernel compilation mode. JIT is experimental and "
+            "uses the runtime nvcc cache."
+        ),
+    )
+    parser.add_argument(
         "--route",
         choices=("alltoall", "local", "cross"),
         default="alltoall",
@@ -166,6 +175,7 @@ def check_output(
 
 def main() -> None:
     args = parse_args()
+    os.environ["MOONCAKE_EP_NCCL_JIT"] = "1" if args.kernel_mode == "jit" else "0"
     rank, world_size = init_distributed(args.seed)
     max_tokens = args.max_tokens or max(128, args.num_tokens)
     num_experts = args.num_experts
@@ -185,6 +195,13 @@ def main() -> None:
         num_gpu_timeout_secs=10,
         **transport_kwargs,
     )
+    if args.kernel_mode == "jit" and buffer.transport != "nccl":
+        raise RuntimeError("--kernel-mode=jit requires the NCCL transport")
+    if args.kernel_mode != buffer.kernel_mode:
+        raise RuntimeError(
+            f"requested {args.kernel_mode} kernels, but the extension selected "
+            f"{buffer.kernel_mode}; rebuild with EP_ENABLE_NCCL_JIT=ON for JIT"
+        )
     route_plan = make_route_plan(
         rank=rank,
         world_size=world_size,
@@ -261,6 +278,18 @@ def main() -> None:
         )
 
     cached_handle = None
+    dist.barrier()
+    torch.cuda.synchronize()
+    setup_start = time.perf_counter()
+    setup_iters = 2 if args.reuse_handle else 1
+    for i in range(setup_iters):
+        cached_handle, _dispatch_ms, _combine_ms, _actual = run_one(
+            -setup_iters + i, cached_handle
+        )
+    torch.cuda.synchronize()
+    dist.barrier()
+    setup_seconds = time.perf_counter() - setup_start
+
     for i in range(args.warmup):
         cached_handle, _dispatch_ms, _combine_ms, _actual = run_one(i, cached_handle)
 
@@ -297,6 +326,12 @@ def main() -> None:
         dtype=torch.float64,
     )
     dist.all_reduce(max_wall_seconds, op=dist.ReduceOp.MAX)
+    max_setup_seconds = torch.tensor(
+        setup_seconds,
+        device="cuda",
+        dtype=torch.float64,
+    )
+    dist.all_reduce(max_setup_seconds, op=dist.ReduceOp.MAX)
 
     if rank == 0:
         table = torch.stack(gathered).cpu()
@@ -318,6 +353,7 @@ def main() -> None:
             f"world={world_size}",
             f"route={args.route}",
             f"transport={buffer.transport}",
+            f"kernel_mode={args.kernel_mode}",
             f"reuse_handle={int(args.reuse_handle)}",
             f"tokens={args.num_tokens}",
             f"hidden={args.hidden}",
@@ -331,6 +367,7 @@ def main() -> None:
             f"combine_critical_ms={combine_critical_ms:.3f}",
             f"e2e_critical_ms={e2e_critical_ms:.3f}",
             f"wall_ms_per_iter={wall_ms_per_iter:.3f}",
+            f"setup_wall_ms={max_setup_seconds.item() * 1000:.3f}",
             f"recv_tokens_avg={table[:, :, 2].mean().item():.1f}",
             f"effective_payload_MB_per_rank={payload_bytes / 1e6:.1f}",
             f"dispatch_effective_GBps={payload_bytes / dispatch_avg_ms / 1e6:.2f}",

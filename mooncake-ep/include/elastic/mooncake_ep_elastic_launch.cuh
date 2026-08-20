@@ -31,6 +31,7 @@ struct NcclContext {
 
 struct ElasticLaunchContext {
     ElasticTransportBackend backend = ElasticTransportBackend::kIbgda;
+    bool use_nccl_jit = false;
     int device_id = -1;
 #ifdef USE_NCCL_DEVICE
     elastic::transport::NcclContext nccl;

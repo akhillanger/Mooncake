@@ -256,6 +256,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
 | `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
+| `-DEP_ENABLE_NCCL_JIT=ON/OFF` | `OFF` | Build the experimental runtime JIT for NCCL `ElasticBuffer` kernels. Requires `WITH_EP=ON`, `USE_CUDA=ON`, `USE_NCCL_DEVICE=ON`, CUDA 12.4+, runtime `nvcc`, and accessible matching source headers. |
 
 ### Build Behavior Options
 

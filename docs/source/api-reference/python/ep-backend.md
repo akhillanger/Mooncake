@@ -429,6 +429,40 @@ importing `mooncake.ep` requires a matching NCCL runtime even when the NCCL
 transport is not selected. Keep the option disabled for deployments that must
 remain compatible with older NCCL runtimes.
 
+### Experimental NCCL kernel JIT
+
+AOT kernels remain the default. For source-build experiments, add
+`-DEP_ENABLE_NCCL_JIT=ON` to an NCCL-enabled EP build, then set
+`MOONCAKE_EP_NCCL_JIT=1` before constructing `ElasticBuffer`. The build option
+requires CUDA 12.4 or newer; it is off by default and does not change normal
+NCCL or IBGDA builds. After construction, `buffer.kernel_mode` reports the
+mode that the native extension actually selected.
+
+The experimental path generates a small CUDA translation unit that explicitly
+instantiates Mooncake's existing NCCL kernel template for the requested runtime
+shape. It compiles that unit to a cubin with `nvcc`, serializes concurrent
+compiles with a file lock, and retains the loaded function per CUDA context.
+It covers the core dispatch, hybrid-dispatch, combine, and hybrid-combine
+kernels. Dispatch/combine prologue and epilogue kernels remain AOT.
+
+Compiled cubins are stored under `/tmp/mooncake_ep/jit` by default. Override the
+location with `MOONCAKE_EP_JIT_CACHE_DIR`; use `MOONCAKE_EP_JIT_LOG=1` for
+compile/load diagnostics and `MOONCAKE_EP_JIT_NVCC` to select `nvcc`. The build
+records source and include paths, so this prototype requires the matching
+Mooncake, CUDA, and NCCL headers to remain accessible at runtime. A cold shape
+pays the `nvcc` compile cost; later processes load its cached cubin. JIT failures
+are not coordinated across ranks in this prototype, so use it only for
+controlled evaluation rather than production jobs.
+
+The benchmark selects the mode explicitly:
+
+```bash
+python mooncake-ep/benchmarks/elastic_buffer_perf.py \
+  --transport nccl --kernel-mode aot
+python mooncake-ep/benchmarks/elastic_buffer_perf.py \
+  --transport nccl --kernel-mode jit
+```
+
 No application-side communicator bootstrap is required. Auto mode creates one
 NCCL unique ID on process-group rank zero and broadcasts it to the group:
 
