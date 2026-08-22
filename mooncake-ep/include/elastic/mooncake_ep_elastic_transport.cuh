@@ -7,7 +7,10 @@
 #include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <elastic/mooncake_ep_elastic_layout.cuh>
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
+#include <transport/device/device_ops.cuh>
+#ifndef MOONCAKE_EP_NCCL_JIT_ONLY
 #include <transport/device/comm_device.cuh>
+#endif
 #ifdef USE_NCCL_DEVICE
 #include <transport/device/nccl_device.cuh>
 #endif
@@ -20,6 +23,8 @@ struct ScaleoutTeam {};
 
 constexpr int kRedAddReleaseHighWordLast = 0;
 constexpr int kRedAddReleaseLowWordLast = 1 << 0;
+
+#ifndef MOONCAKE_EP_NCCL_JIT_ONLY
 
 // Mooncake Device API adapter for DeepEP's NCCL GIN usage.
 //
@@ -311,6 +316,8 @@ struct IbgdaOps {
 
     __device__ __forceinline__ void flush() const { __threadfence_system(); }
 };
+
+#endif  // MOONCAKE_EP_NCCL_JIT_ONLY
 
 #ifdef USE_NCCL_DEVICE
 

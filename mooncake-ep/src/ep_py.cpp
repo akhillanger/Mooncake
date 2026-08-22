@@ -68,6 +68,7 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("nccl_unique_id") = std::vector<int32_t>{})
         .def("destroy", &MooncakeElasticBuffer::destroy)
         .def("using_nccl", &MooncakeElasticBuffer::using_nccl)
+        .def("using_nccl_jit", &MooncakeElasticBuffer::using_nccl_jit)
         .def_static("calculate_buffer_size",
                     &MooncakeElasticBuffer::calculate_buffer_size)
         .def("get_physical_domain_size",

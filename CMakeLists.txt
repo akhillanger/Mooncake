@@ -101,6 +101,8 @@ if (WITH_STORE_RUST)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
+option(EP_ENABLE_NCCL_JIT
+       "Build the experimental runtime JIT for NCCL ElasticBuffer kernels" OFF)
 if (WITH_EP)
   add_subdirectory(mooncake-pg)
   include_directories(mooncake-pg/include)

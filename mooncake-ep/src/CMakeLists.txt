@@ -8,6 +8,15 @@ set(MOONCAKE_EP_DEVICE_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_ep_kernel.cu"
     "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_ep_elastic_kernel.cu")
 
+if(EP_ENABLE_NCCL_JIT)
+  if(NOT USE_CUDA OR NOT USE_NCCL_DEVICE)
+    message(FATAL_ERROR
+            "EP_ENABLE_NCCL_JIT requires USE_CUDA=ON and USE_NCCL_DEVICE=ON")
+  endif()
+  list(APPEND MOONCAKE_EP_DEVICE_SOURCES
+       "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_ep_elastic_jit.cpp")
+endif()
+
 if(USE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
@@ -36,6 +45,22 @@ if(USE_CUDA)
   target_link_libraries(mooncake_ep_device PRIVATE CUDA::cudart)
   if(USE_NCCL_DEVICE)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
+    if(EP_ENABLE_NCCL_JIT)
+      if(CUDAToolkit_VERSION VERSION_LESS 12.4)
+        message(FATAL_ERROR "EP_ENABLE_NCCL_JIT requires CUDA 12.4 or newer")
+      endif()
+      list(GET CUDAToolkit_INCLUDE_DIRS 0 _ep_cuda_include_dir)
+      target_compile_definitions(
+        mooncake_ep_device PRIVATE
+        MOONCAKE_EP_ENABLE_NCCL_JIT=1
+        MOONCAKE_EP_JIT_EP_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include"
+        MOONCAKE_EP_JIT_TE_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
+        MOONCAKE_EP_JIT_NCCL_INCLUDE_DIR="${NCCL_DEVICE_INCLUDE_DIR}"
+        MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR="${_ep_cuda_include_dir}"
+        MOONCAKE_EP_JIT_NVCC="${CMAKE_CUDA_COMPILER}")
+      target_link_libraries(mooncake_ep_device PRIVATE CUDA::cuda_driver)
+      unset(_ep_cuda_include_dir)
+    endif()
   endif()
 elseif(USE_MUSA)
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
@@ -101,6 +126,9 @@ else()
 endif()
 set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(_ep PROPERTIES INSTALL_RPATH "$ORIGIN")
+if(EP_ENABLE_NCCL_JIT)
+  target_compile_definitions(_ep PRIVATE MOONCAKE_EP_ENABLE_NCCL_JIT=1)
+endif()
 if(USE_MUSA)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MUSA=1)
 endif()

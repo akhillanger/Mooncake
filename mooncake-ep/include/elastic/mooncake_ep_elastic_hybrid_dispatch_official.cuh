@@ -14,26 +14,26 @@
 
 namespace mooncake::elastic {
 
-template <
-    typename Ops, bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs,
-    int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
-    int kNumScaleoutRanks, int kNumScaleupRanks, int kNumHiddenBytes,
-    int kNumSFPacks, int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
-    int kExpertAlignment, int kNumQPs, int64_t kNumTimeoutCycles,
-    int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks,
-                                                           32),
-    int kNumChannelsPerSM = kNumScaleoutWarps,
-    int kNumChannels = kNumScaleoutWarps * kNumSMs,
-    int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank,
-                                                           kNumChannels),
-    int kScaleoutUpdateInterval = Ops::kScaleoutUpdateInterval,
-    int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
-    int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
-    int kNumNotifyThreads = kNumNotifyWarps * 32,
-    int kNumScaleoutSendThreads = kNumScaleoutWarps * 32,
-    int kNumForwardThreads = kNumForwardWarps * 32,
-    int kNumThreads = kNumNotifyThreads + kNumScaleoutSendThreads +
-                      kNumForwardThreads>
+template <typename Ops, bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs,
+          int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
+          int kNumScaleoutRanks, int kNumScaleupRanks, int kNumHiddenBytes,
+          int kNumSFPacks, int kNumMaxTokensPerRank, int kNumExperts,
+          int kNumTopk, int kExpertAlignment, int kNumQPs,
+          int64_t kNumTimeoutCycles, bool kUseGlobalNotifyWorkspace = false,
+          int kNumScaleupRanksPerLane =
+              math::constexpr_ceil_div(kNumScaleupRanks, 32),
+          int kNumChannelsPerSM = kNumScaleoutWarps,
+          int kNumChannels = kNumScaleoutWarps * kNumSMs,
+          int kNumMaxTokensPerChannel =
+              math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
+          int kScaleoutUpdateInterval = Ops::kScaleoutUpdateInterval,
+          int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
+          int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
+          int kNumNotifyThreads = kNumNotifyWarps * 32,
+          int kNumScaleoutSendThreads = kNumScaleoutWarps * 32,
+          int kNumForwardThreads = kNumForwardWarps * 32,
+          int kNumThreads = kNumNotifyThreads + kNumScaleoutSendThreads +
+                            kNumForwardThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
     hybrid_dispatch_impl(void* x, sf_pack_t* sf, topk_idx_t* topk_idx,
                          float* topk_weights, topk_idx_t* copied_topk_idx,
@@ -55,6 +55,15 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps,
                      "Invalid warp size");
+    EP_STATIC_ASSERT(not kUseGlobalNotifyWorkspace or kNumNotifyWarps > 0,
+                     "Global notify requires notify warps");
+    EP_STATIC_ASSERT(
+        not kUseGlobalNotifyWorkspace or
+            (kNumRanks + kNumExperts) * (sizeof(int64_t) + sizeof(int)) <=
+                (layout::WorkspaceLayout::kNumMaxRanks +
+                 layout::WorkspaceLayout::kNumMaxExperts) *
+                    sizeof(int64_t),
+        "Insufficient global notify workspace");
 
     // Utils
     // NOTES: a warp is a channel (different channels may share QPs)
@@ -75,10 +84,11 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     // memory)
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     constexpr int kNumSmemBytesForNotify =
-        kNumNotifyThreads > 0 ? math::constexpr_align(kNumRanks + kNumExperts,
-                                                      kNumNotifyThreads) *
-                                    sizeof(int)
-                              : 0;
+        kNumNotifyThreads > 0 and not kUseGlobalNotifyWorkspace
+            ? math::constexpr_align(kNumRanks + kNumExperts,
+                                    kNumNotifyThreads) *
+                  sizeof(int)
+            : 0;
     EP_STATIC_ASSERT(kNumSmemBytesForNotify % ptx::kNumTMAAlignBytes == 0,
                      "Invalid TMA alignment");
 
@@ -134,21 +144,34 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
-        // Assign shared memory
+        // The global fallback is used only when wide token staging leaves no
+        // room for the notify array. The fixed workspace reserves substantially
+        // more counters than a concrete launch needs, so its unused tail can
+        // hold the final prefix-sum input.
         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
-        const auto rank_expert_count = math::advance_ptr<int>(smem, 0);
+        const auto rank_expert_count = [&]() {
+            if constexpr (kUseGlobalNotifyWorkspace) {
+                return math::advance_ptr<int>(
+                    workspace_layout.get_notify_reduction_workspace_ptr(),
+                    (kNumRanks + kNumExperts) * sizeof(int64_t));
+            } else {
+                return math::advance_ptr<int>(smem, 0);
+            }
+        }();
 
         // Clean initial counts
         // NOTES: if you want to change the order of different warp roles,
         // please take care of the `thread_idx`
         int *rank_count = rank_expert_count,
             *expert_count = rank_expert_count + kNumRanks;
+        if constexpr (not kUseGlobalNotifyWorkspace) {
 #pragma unroll
-        for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++i)
-            rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++i)
+                rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
+            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        }
 
-        // Atomic add on shared memory
+        // Count routing choices in shared memory or the global fallback.
         EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes");
         const auto global_warp_idx = sm_idx * kNumNotifyWarps + warp_idx;
         for (int i = global_warp_idx; i < num_tokens;
@@ -159,25 +182,53 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 lane_idx < kNumTopk ? static_cast<int>(__ldg(
                                           topk_idx + i * kNumTopk + lane_idx))
                                     : -1;
-            if (dst_expert_idx >= 0)
-                atomicAdd_block(expert_count + dst_expert_idx, 1);
+            if (dst_expert_idx >= 0) {
+                if constexpr (kUseGlobalNotifyWorkspace) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(
+                                  workspace_layout
+                                      .get_notify_reduction_workspace_ptr() +
+                                  kNumRanks + dst_expert_idx),
+                              1ull);
+                } else {
+                    atomicAdd_block(expert_count + dst_expert_idx, 1);
+                }
+            }
 
             // Rank choice should do deduplication here
             const auto dst_rank_idx =
                 dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
-            if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
-                atomicAdd_block(rank_count + dst_rank_idx, 1);
+            if (ptx::deduplicate(dst_rank_idx, lane_idx) and
+                dst_rank_idx >= 0) {
+                if constexpr (kUseGlobalNotifyWorkspace) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(
+                                  workspace_layout
+                                      .get_notify_reduction_workspace_ptr() +
+                                  dst_rank_idx),
+                              1ull);
+                } else {
+                    atomicAdd_block(rank_count + dst_rank_idx, 1);
+                }
+            }
         }
+        if constexpr (kUseGlobalNotifyWorkspace) __threadfence();
         ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
 // Do full-grid reduction
 #pragma unroll
         for (int i = thread_idx; i < kNumRanks + kNumExperts;
              i += kNumNotifyThreads) {
-            const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
-            ptx::red_add(
-                workspace_layout.get_notify_reduction_workspace_ptr() + i,
-                counter);
+            if constexpr (kUseGlobalNotifyWorkspace) {
+                atomicAdd(
+                    reinterpret_cast<unsigned long long*>(
+                        workspace_layout.get_notify_reduction_workspace_ptr() +
+                        i),
+                    1ull << 32);
+            } else {
+                const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
+                ptx::red_add(
+                    workspace_layout.get_notify_reduction_workspace_ptr() + i,
+                    counter);
+            }
         }
 
         // Do the remaining work by SM 0
@@ -871,6 +922,25 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 channel_idx, lane_idx);
         }
         __syncwarp();
+    }
+
+    // Ensure the notify warps have finished reading their prefix-sum input
+    // before other warp roles can clear the shared global scratch.
+    if constexpr (kUseGlobalNotifyWorkspace) __syncthreads();
+
+    // The global fallback reuses the otherwise-unused tail of the notify
+    // reduction workspace as temporary prefix-sum input. Clear it before the
+    // final grid barrier so a later launch with a larger shape cannot interpret
+    // stale scratch values as packed reduction counters.
+    if constexpr (kUseGlobalNotifyWorkspace) {
+        if (sm_idx == 0) {
+            const auto scratch = math::advance_ptr<int>(
+                workspace_layout.get_notify_reduction_workspace_ptr(),
+                (kNumRanks + kNumExperts) * sizeof(int64_t));
+            for (int i = thread_idx; i < kNumScaleupRanks + kNumExpertsPerRank;
+                 i += kNumThreads)
+                scratch[i] = 0;
+        }
     }
 
     // Scale-up barrier to ensure data arrival

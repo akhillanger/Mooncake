@@ -37,6 +37,7 @@ struct ElasticConfig {
     int64_t num_topk = 0;
     bool use_fp8_dispatch = false;
     bool deterministic = false;
+    bool use_nccl_jit = false;
     bool allow_hybrid_mode = true;
     bool allow_multiple_reduction = true;
     bool prefer_overlap_with_compute = true;
@@ -74,6 +75,7 @@ class MooncakeElasticBuffer {
     // communicator rank. The Python wrapper provides that collective protocol.
     void destroy();
     bool using_nccl() const { return nccl_state_ != nullptr; }
+    bool using_nccl_jit() const { return config_.use_nccl_jit; }
 
     static int64_t calculate_buffer_size(int num_ranks,
                                          int64_t num_max_tokens_per_rank,
