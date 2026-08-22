@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -86,7 +87,7 @@ struct LoadedKernel {
 
 struct MemoryKey {
     CUcontext context = nullptr;
-    std::array<int, 13> values{};
+    std::array<int, 18> values{};
 
     bool operator==(const MemoryKey& other) const {
         return context == other.context && values == other.values;
@@ -123,6 +124,22 @@ bool env_flag(const char* name, bool default_value) {
     }
     throw std::invalid_argument(
         std::string(name) + " must be one of 0, 1, false, true, off, or on");
+}
+
+int env_integer(const char* name, int default_value) {
+    const std::string value = env_value(name);
+    if (value.empty()) return default_value;
+
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (errno == ERANGE || end == value.c_str() || *end != '\0' ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be a base-10 integer");
+    }
+    return static_cast<int>(parsed);
 }
 
 bool log_enabled() { return env_flag("MOONCAKE_EP_JIT_LOG", false); }
@@ -422,7 +439,10 @@ std::string dispatch_variant_name(const DispatchSpec& spec) {
          << spec.num_topk << "_sms" << spec.num_sms << "_so"
          << spec.num_scaleout_ranks << "_su" << spec.num_scaleup_ranks
          << "_notify" << spec.num_notify_warps << "_reuse"
-         << static_cast<int>(spec.reuse_slot_indices);
+         << static_cast<int>(spec.reuse_slot_indices) << "_dw"
+         << spec.num_dispatch_warps << "_hsow" << spec.num_hybrid_scaleout_warps
+         << "_hfw" << spec.num_hybrid_forward_warps << "_gnotify"
+         << static_cast<int>(spec.use_global_notify_workspace);
     return name.str();
 }
 
@@ -432,7 +452,31 @@ std::string combine_variant_name(const CombineSpec& spec) {
          << "_h" << spec.hidden << "_max" << spec.num_max_tokens_per_rank
          << "_e" << spec.num_experts << "_k" << spec.num_topk << "_sms"
          << spec.num_sms << "_so" << spec.num_scaleout_ranks << "_su"
-         << spec.num_scaleup_ranks;
+         << spec.num_scaleup_ranks << "_cw" << spec.num_combine_warps << "_hsuw"
+         << spec.num_hybrid_scaleup_warps << "_hfw"
+         << spec.num_hybrid_forward_warps;
+    return name.str();
+}
+
+std::string dispatch_epilogue_variant_name(const DispatchEpilogueSpec& spec) {
+    std::ostringstream name;
+    name << "dispatch_epilogue_hb" << spec.hidden_bytes << "_sf"
+         << spec.num_sf_packs << "_max" << spec.num_max_tokens_per_rank << "_e"
+         << spec.num_experts << "_k" << spec.num_topk << "_sms" << spec.num_sms
+         << "_channels" << spec.num_channels << "_warps" << spec.num_warps
+         << "_so" << spec.num_scaleout_ranks << "_su" << spec.num_scaleup_ranks
+         << "_expand" << static_cast<int>(spec.do_expand) << "_cached"
+         << static_cast<int>(spec.cached_mode);
+    return name.str();
+}
+
+std::string combine_epilogue_variant_name(const CombineEpilogueSpec& spec) {
+    std::ostringstream name;
+    name << "combine_epilogue_h" << spec.hidden << "_max"
+         << spec.num_max_tokens_per_rank << "_e" << spec.num_experts << "_k"
+         << spec.num_topk << "_sms" << spec.num_sms << "_warps"
+         << spec.num_warps << "_unroll" << spec.reduction_unroll_factor << "_so"
+         << spec.num_scaleout_ranks << "_su" << spec.num_scaleup_ranks;
     return name.str();
 }
 
@@ -446,9 +490,9 @@ std::string dispatch_source(const DispatchSpec& spec) {
         source << "template __global__ void mooncake::elastic::dispatch_impl<\n"
                << "    Ops, true, false, "
                << (spec.reuse_slot_indices ? "true" : "false") << ", "
-               << spec.num_sms << ", " << spec.num_notify_warps
-               << ", Ops::kNumDispatchWarps, " << spec.num_scaleup_ranks << ", "
-               << spec.hidden_bytes << ", " << spec.num_sf_packs << ", "
+               << spec.num_sms << ", " << spec.num_notify_warps << ", "
+               << spec.num_dispatch_warps << ", " << spec.num_scaleup_ranks
+               << ", " << spec.hidden_bytes << ", " << spec.num_sf_packs << ", "
                << spec.num_max_tokens_per_rank << ", " << spec.num_experts
                << ", " << spec.num_topk << ", 1, Ops::kNumQPs, "
                << kTimeoutCycles << "ll>(\n"
@@ -463,13 +507,14 @@ std::string dispatch_source(const DispatchSpec& spec) {
                "mooncake::elastic::hybrid_dispatch_impl<\n"
             << "    Ops, false, "
             << (spec.reuse_slot_indices ? "true" : "false") << ", "
-            << spec.num_sms << ", " << spec.num_notify_warps
-            << ", Ops::kNumHybridScaleoutWarps, Ops::kNumHybridForwardWarps, "
-            << spec.num_scaleout_ranks << ", " << spec.num_scaleup_ranks << ", "
-            << spec.hidden_bytes << ", " << spec.num_sf_packs << ", "
-            << spec.num_max_tokens_per_rank << ", " << spec.num_experts << ", "
-            << spec.num_topk << ", 1, Ops::kNumQPs, " << kTimeoutCycles
-            << "ll>(\n"
+            << spec.num_sms << ", " << spec.num_notify_warps << ", "
+            << spec.num_hybrid_scaleout_warps << ", "
+            << spec.num_hybrid_forward_warps << ", " << spec.num_scaleout_ranks
+            << ", " << spec.num_scaleup_ranks << ", " << spec.hidden_bytes
+            << ", " << spec.num_sf_packs << ", " << spec.num_max_tokens_per_rank
+            << ", " << spec.num_experts << ", " << spec.num_topk
+            << ", 1, Ops::kNumQPs, " << kTimeoutCycles << "ll, "
+            << (spec.use_global_notify_workspace ? "true" : "false") << ">(\n"
             << "    void*, mooncake::sf_pack_t*, mooncake::topk_idx_t*, "
                "float*,\n"
             << "    mooncake::topk_idx_t*, int*, int*, int*, int*, int*, int, "
@@ -487,10 +532,10 @@ std::string combine_source(const CombineSpec& spec) {
            << "using Ops = mooncake::elastic::transport::NcclOps;\n\n";
     if (spec.num_scaleout_ranks == 1) {
         source << "template __global__ void mooncake::elastic::combine_impl<\n"
-               << "    Ops, true, false, true, " << spec.num_sms
-               << ", Ops::kNumCombineWarps, " << spec.num_scaleup_ranks << ", "
-               << spec.hidden << ", " << spec.num_max_tokens_per_rank << ", "
-               << spec.num_experts << ", " << spec.num_topk
+               << "    Ops, true, false, true, " << spec.num_sms << ", "
+               << spec.num_combine_warps << ", " << spec.num_scaleup_ranks
+               << ", " << spec.hidden << ", " << spec.num_max_tokens_per_rank
+               << ", " << spec.num_experts << ", " << spec.num_topk
                << ", Ops::kNumQPs, " << kTimeoutCycles << "ll>(\n"
                << "    nv_bfloat16*, float*, int*, int*, const Ops::Context, "
                   "void*,\n"
@@ -498,8 +543,9 @@ std::string combine_source(const CombineSpec& spec) {
     } else {
         source << "template __global__ void "
                   "mooncake::elastic::hybrid_combine_impl<\n"
-               << "    Ops, false, true, " << spec.num_sms
-               << ", Ops::kNumHybridScaleupWarps, Ops::kNumHybridForwardWarps, "
+               << "    Ops, false, true, " << spec.num_sms << ", "
+               << spec.num_hybrid_scaleup_warps << ", "
+               << spec.num_hybrid_forward_warps << ", "
                << spec.num_scaleout_ranks << ", " << spec.num_scaleup_ranks
                << ", " << spec.hidden << ", " << spec.num_max_tokens_per_rank
                << ", " << spec.num_experts << ", " << spec.num_topk
@@ -507,6 +553,41 @@ std::string combine_source(const CombineSpec& spec) {
                << "    nv_bfloat16*, float*, int*, int*, int*, int*,\n"
                << "    const Ops::Context, void*, void*, int, int, int);\n";
     }
+    return source.str();
+}
+
+std::string dispatch_epilogue_source(const DispatchEpilogueSpec& spec) {
+    std::ostringstream source;
+    source << "#include <elastic/"
+              "mooncake_ep_elastic_dispatch_copy_epilogue.cuh>\n\n"
+           << "template __global__ void "
+              "mooncake::elastic::dispatch_copy_epilogue_impl<\n"
+           << "    " << (spec.do_expand ? "true" : "false") << ", "
+           << (spec.cached_mode ? "true" : "false") << ", 0, "
+           << spec.num_channels << ", " << spec.num_warps << ", "
+           << spec.num_scaleout_ranks << ", " << spec.num_scaleup_ranks << ", "
+           << spec.hidden_bytes << ", " << spec.num_sf_packs << ", "
+           << spec.num_max_tokens_per_rank << ", " << spec.num_experts << ", "
+           << spec.num_topk << ">(\n"
+           << "    void*, void*, int*, int*, void*, mooncake::sf_pack_t*,\n"
+           << "    mooncake::topk_idx_t*, float*, int*, int*, int, int, int, "
+              "int, int);\n";
+    return source.str();
+}
+
+std::string combine_epilogue_source(const CombineEpilogueSpec& spec) {
+    std::ostringstream source;
+    source << "#include <elastic/"
+              "mooncake_ep_elastic_combine_reduce_epilogue.cuh>\n\n"
+           << "template __global__ void "
+              "mooncake::elastic::combine_reduce_epilogue_impl<\n"
+           << "    false, true, 0, " << spec.num_warps << ", "
+           << spec.num_scaleout_ranks << ", " << spec.num_scaleup_ranks << ", "
+           << spec.hidden << ", " << spec.num_max_tokens_per_rank << ", "
+           << spec.num_experts << ", " << spec.num_topk << ", "
+           << spec.reduction_unroll_factor << ">(\n"
+           << "    nv_bfloat16*, float*, mooncake::topk_idx_t*, void*, void*, "
+              "void*, int, int, int);\n";
     return source.str();
 }
 
@@ -519,6 +600,16 @@ KernelVariant make_dispatch_variant(const DispatchSpec& spec) {
 KernelVariant make_combine_variant(const CombineSpec& spec) {
     return {spec.num_scaleout_ranks == 1 ? "combine" : "hybrid_combine",
             combine_variant_name(spec), combine_source(spec), spec.smem_bytes};
+}
+
+KernelVariant make_dispatch_epilogue_variant(const DispatchEpilogueSpec& spec) {
+    return {"dispatch_epilogue", dispatch_epilogue_variant_name(spec),
+            dispatch_epilogue_source(spec), spec.smem_bytes};
+}
+
+KernelVariant make_combine_epilogue_variant(const CombineEpilogueSpec& spec) {
+    return {"combine_epilogue", combine_epilogue_variant_name(spec),
+            combine_epilogue_source(spec), spec.smem_bytes};
 }
 
 std::string compile_key(const KernelVariant& variant, int sm,
@@ -597,13 +688,15 @@ CUcontext current_context() {
 }
 
 MemoryKey memory_key(const DispatchSpec& spec, CUcontext context) {
-    return {
-        context,
-        {spec.num_scaleout_ranks == 1 ? 1 : 2, spec.hidden_bytes,
-         spec.num_sf_packs, spec.num_max_tokens_per_rank, spec.num_experts,
-         spec.num_topk, spec.num_sms, spec.num_notify_warps, spec.num_threads,
-         spec.smem_bytes, spec.num_scaleout_ranks, spec.num_scaleup_ranks,
-         static_cast<int>(spec.reuse_slot_indices)}};
+    return {context,
+            {spec.num_scaleout_ranks == 1 ? 1 : 2, spec.hidden_bytes,
+             spec.num_sf_packs, spec.num_max_tokens_per_rank, spec.num_experts,
+             spec.num_topk, spec.num_sms, spec.num_notify_warps,
+             spec.num_threads, spec.smem_bytes, spec.num_dispatch_warps,
+             spec.num_hybrid_scaleout_warps, spec.num_hybrid_forward_warps,
+             spec.num_scaleout_ranks, spec.num_scaleup_ranks,
+             static_cast<int>(spec.reuse_slot_indices),
+             static_cast<int>(spec.use_global_notify_workspace), 0}};
 }
 
 MemoryKey memory_key(const CombineSpec& spec, CUcontext context) {
@@ -611,7 +704,28 @@ MemoryKey memory_key(const CombineSpec& spec, CUcontext context) {
             {spec.num_scaleout_ranks == 1 ? 3 : 4, spec.hidden,
              spec.num_max_tokens_per_rank, spec.num_experts, spec.num_topk,
              spec.num_sms, spec.num_threads, spec.smem_bytes,
-             spec.num_scaleout_ranks, spec.num_scaleup_ranks, 0, 0, 0}};
+             spec.num_combine_warps, spec.num_hybrid_scaleup_warps,
+             spec.num_hybrid_forward_warps, spec.num_scaleout_ranks,
+             spec.num_scaleup_ranks, 0, 0, 0, 0, 0}};
+}
+
+MemoryKey memory_key(const DispatchEpilogueSpec& spec, CUcontext context) {
+    return {context,
+            {5, spec.hidden_bytes, spec.num_sf_packs,
+             spec.num_max_tokens_per_rank, spec.num_experts, spec.num_topk,
+             spec.num_sms, spec.num_threads, spec.smem_bytes, spec.num_channels,
+             spec.num_warps, spec.num_scaleout_ranks, spec.num_scaleup_ranks,
+             static_cast<int>(spec.do_expand),
+             static_cast<int>(spec.cached_mode), 0, 0, 0}};
+}
+
+MemoryKey memory_key(const CombineEpilogueSpec& spec, CUcontext context) {
+    return {
+        context,
+        {6, spec.hidden, spec.num_max_tokens_per_rank, spec.num_experts,
+         spec.num_topk, spec.num_sms, spec.num_threads, spec.smem_bytes,
+         spec.num_warps, spec.reduction_unroll_factor, spec.num_scaleout_ranks,
+         spec.num_scaleup_ranks, 0, 0, 0, 0, 0, 0}};
 }
 
 class KernelCache {
@@ -629,6 +743,16 @@ class KernelCache {
     CUfunction get(const CombineSpec& spec) {
         const MemoryKey key = memory_key(spec, current_context());
         return get(key, [&] { return make_combine_variant(spec); });
+    }
+
+    CUfunction get(const DispatchEpilogueSpec& spec) {
+        const MemoryKey key = memory_key(spec, current_context());
+        return get(key, [&] { return make_dispatch_epilogue_variant(spec); });
+    }
+
+    CUfunction get(const CombineEpilogueSpec& spec) {
+        const MemoryKey key = memory_key(spec, current_context());
+        return get(key, [&] { return make_combine_epilogue_variant(spec); });
     }
 
    private:
@@ -725,22 +849,67 @@ class KernelCache {
 };
 
 template <typename Spec>
-void launch_kernel(const Spec& spec, void** arguments, cudaStream_t stream) {
+void launch_kernel(const Spec& spec, void** arguments, cudaStream_t stream,
+                   bool programmatic_stream_serialization = false) {
     CUfunction function = KernelCache::instance().get(spec);
-    const CUresult status = cuLaunchCooperativeKernel(
-        function, spec.num_sms, 1, 1, spec.num_threads, 1, 1,
+    CUlaunchAttribute attributes[2]{};
+    attributes[0].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+    attributes[0].value.cooperative = 1;
+    if (programmatic_stream_serialization) {
+        attributes[1].id =
+            CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        attributes[1].value.programmaticStreamSerializationAllowed = 1;
+    }
+    CUlaunchConfig config{
+        static_cast<unsigned int>(spec.num_sms),
+        1,
+        1,
+        static_cast<unsigned int>(spec.num_threads),
+        1,
+        1,
         static_cast<unsigned int>(spec.smem_bytes),
-        reinterpret_cast<CUstream>(stream), arguments);
-    if (status != CUDA_SUCCESS) {
+        reinterpret_cast<CUstream>(stream),
+        attributes,
+        programmatic_stream_serialization ? 2u : 1u,
+    };
+    const CUresult status =
+        cuLaunchKernelEx(&config, function, arguments, nullptr);
+    if (status != CUDA_SUCCESS)
         throw std::runtime_error("cannot launch Mooncake EP JIT kernel: " +
                                  cuda_error(status));
-    }
 }
 
 }  // namespace
 
 bool requested_by_environment() {
     return env_flag("MOONCAKE_EP_NCCL_JIT", false);
+}
+
+int requested_combine_unroll_factor(int hidden) {
+    const int factor = env_integer("MOONCAKE_EP_JIT_COMBINE_UNROLL", 0);
+    if (factor < 0) {
+        throw std::invalid_argument(
+            "MOONCAKE_EP_JIT_COMBINE_UNROLL must be nonnegative");
+    }
+    const int64_t divisor = static_cast<int64_t>(factor) * 32 *
+                            (sizeof(int4) / sizeof(nv_bfloat16));
+    if (factor != 0 &&
+        (hidden <= 0 || divisor > hidden || hidden % divisor != 0)) {
+        throw std::invalid_argument(
+            "MOONCAKE_EP_JIT_COMBINE_UNROLL must divide the number of hidden "
+            "vectors assigned to each warp lane");
+    }
+    return factor;
+}
+
+int requested_combine_epilogue_warps(int default_warps) {
+    const int warps =
+        env_integer("MOONCAKE_EP_JIT_COMBINE_EPILOGUE_WARPS", default_warps);
+    if (warps <= 0 || warps > 32) {
+        throw std::invalid_argument(
+            "MOONCAKE_EP_JIT_COMBINE_EPILOGUE_WARPS must be in [1, 32]");
+    }
+    return warps;
 }
 
 void launch_dispatch(const DispatchSpec& spec, void* x, void* sf,
@@ -804,6 +973,37 @@ void launch_dispatch(const DispatchSpec& spec, void* x, void* sf,
     launch_kernel(spec, arguments, stream);
 }
 
+void launch_dispatch_epilogue(const DispatchEpilogueSpec& spec, void* buffer,
+                              void* workspace,
+                              int* psum_num_recv_tokens_per_scaleup_rank,
+                              int* psum_num_recv_tokens_per_expert,
+                              void* recv_x, void* recv_sf,
+                              int64_t* recv_topk_idx, float* recv_topk_weights,
+                              int* recv_src_metadata, int* channel_linked_list,
+                              int num_recv_tokens, int recv_sf_token_stride,
+                              int recv_sf_hidden_stride, int scaleout_rank_idx,
+                              int scaleup_rank_idx, cudaStream_t stream) {
+    static_assert(sizeof(topk_idx_t) == sizeof(int64_t));
+    void* arguments[] = {
+        &buffer,
+        &workspace,
+        &psum_num_recv_tokens_per_scaleup_rank,
+        &psum_num_recv_tokens_per_expert,
+        &recv_x,
+        &recv_sf,
+        &recv_topk_idx,
+        &recv_topk_weights,
+        &recv_src_metadata,
+        &channel_linked_list,
+        &num_recv_tokens,
+        &recv_sf_token_stride,
+        &recv_sf_hidden_stride,
+        &scaleout_rank_idx,
+        &scaleup_rank_idx,
+    };
+    launch_kernel(spec, arguments, stream, true);
+}
+
 void launch_combine(const CombineSpec& spec, void* x, float* topk_weights,
                     int* src_metadata,
                     int* psum_num_recv_tokens_per_scaleup_rank,
@@ -843,6 +1043,27 @@ void launch_combine(const CombineSpec& spec, void* x, float* topk_weights,
         &num_reduced_tokens,
     };
     launch_kernel(spec, arguments, stream);
+}
+
+void launch_combine_epilogue(const CombineEpilogueSpec& spec, void* combined_x,
+                             float* combined_topk_weights,
+                             int64_t* combined_topk_idx, void* recv_buffer,
+                             void* bias_0, void* bias_1,
+                             int num_combined_tokens, int scaleout_rank_idx,
+                             int scaleup_rank_idx, cudaStream_t stream) {
+    static_assert(sizeof(topk_idx_t) == sizeof(int64_t));
+    void* arguments[] = {
+        &combined_x,
+        &combined_topk_weights,
+        &combined_topk_idx,
+        &recv_buffer,
+        &bias_0,
+        &bias_1,
+        &num_combined_tokens,
+        &scaleout_rank_idx,
+        &scaleup_rank_idx,
+    };
+    launch_kernel(spec, arguments, stream, true);
 }
 
 }  // namespace mooncake::elastic::jit

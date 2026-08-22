@@ -442,8 +442,9 @@ The experimental path generates a small CUDA translation unit that explicitly
 instantiates Mooncake's existing NCCL kernel template for the requested runtime
 shape. It compiles that unit to a cubin with `nvcc`, serializes concurrent
 compiles with a file lock, and retains the loaded function per CUDA context.
-It covers the core dispatch, hybrid-dispatch, combine, and hybrid-combine
-kernels. Dispatch/combine prologue and epilogue kernels remain AOT.
+It covers dispatch, hybrid dispatch, dispatch copy epilogue, combine, hybrid
+combine, and combine reduction epilogue kernels. The deterministic dispatch
+prologue remains AOT.
 
 Compiled cubins are stored under `/tmp/mooncake_ep/jit` by default. Override the
 location with `MOONCAKE_EP_JIT_CACHE_DIR`; use `MOONCAKE_EP_JIT_LOG=1` for
@@ -453,6 +454,20 @@ Mooncake, CUDA, and NCCL headers to remain accessible at runtime. A cold shape
 pays the `nvcc` compile cost; later processes load its cached cubin. JIT failures
 are not coordinated across ranks in this prototype, so use it only for
 controlled evaluation rather than production jobs.
+
+The prototype cache does not fingerprint every included header. Clear the cache
+after modifying or replacing Mooncake, CUDA, or NCCL headers in place.
+
+Two environment variables expose combine-epilogue tuning for controlled
+performance studies:
+
+- `MOONCAKE_EP_JIT_COMBINE_UNROLL` selects the compile-time reduction unroll
+  factor. `0` keeps Mooncake's existing capped-unroll policy. A nonzero value
+  must evenly divide the number of hidden vectors assigned to each warp lane.
+- `MOONCAKE_EP_JIT_COMBINE_EPILOGUE_WARPS` overrides the number of epilogue
+  warps after the JIT path has calculated the largest shared-memory-safe value.
+
+These settings are experimental and have no effect on AOT or IBGDA kernels.
 
 The benchmark selects the mode explicitly:
 

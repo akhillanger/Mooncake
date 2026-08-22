@@ -17,7 +17,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction, int kNumSMs,
           // does not contain "scaleup")
           int kNumScaleoutRanks, int kNumScaleupRanks, int kHidden,
           int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
-          int kNumThreads = kNumWarps * 32,
+          int kReductionUnrollFactor = 0, int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           int kNumRanks = kNumScaleoutRanks == 1 ? kNumScaleupRanks
                                                  : kNumScaleoutRanks,
@@ -135,7 +135,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             typename CombineVecTraits<kHidden * sizeof(nv_bfloat16)>::vec_t;
         constexpr int kHiddenVec =
             kHidden * sizeof(nv_bfloat16) / sizeof(combine_vec_t);
-        constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+        constexpr int kDefaultUnrollFactor =
+            get_max_unroll_factor<kHiddenVec, 4>();
+        constexpr int kUnrollFactor = kReductionUnrollFactor == 0
+                                          ? kDefaultUnrollFactor
+                                          : kReductionUnrollFactor;
+        EP_STATIC_ASSERT(kUnrollFactor > 0, "Invalid unrolling");
+        EP_STATIC_ASSERT(kHiddenVec % (kUnrollFactor * 32) == 0,
+                         "Invalid unrolling");
         combine_reduce<kHiddenVec, kUnrollFactor, kNumTokensInLayout>(
             lane_idx, topk_slot_idx,
             static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),

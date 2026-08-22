@@ -23,6 +23,10 @@ struct DispatchSpec {
     int num_notify_warps = 0;
     int num_threads = 0;
     int smem_bytes = 0;
+    int num_dispatch_warps = 0;
+    int num_hybrid_scaleout_warps = 0;
+    int num_hybrid_forward_warps = 0;
+    bool use_global_notify_workspace = false;
     int num_scaleout_ranks = 1;
     int num_scaleup_ranks = 1;
     bool reuse_slot_indices = false;
@@ -36,6 +40,40 @@ struct CombineSpec {
     int num_sms = 0;
     int num_threads = 0;
     int smem_bytes = 0;
+    int num_combine_warps = 0;
+    int num_hybrid_scaleup_warps = 0;
+    int num_hybrid_forward_warps = 0;
+    int num_scaleout_ranks = 1;
+    int num_scaleup_ranks = 1;
+};
+
+struct DispatchEpilogueSpec {
+    int hidden_bytes = 0;
+    int num_sf_packs = 0;
+    int num_max_tokens_per_rank = 0;
+    int num_experts = 0;
+    int num_topk = 0;
+    int num_sms = 0;
+    int num_threads = 0;
+    int smem_bytes = 0;
+    int num_channels = 0;
+    int num_warps = 0;
+    int num_scaleout_ranks = 1;
+    int num_scaleup_ranks = 1;
+    bool do_expand = false;
+    bool cached_mode = false;
+};
+
+struct CombineEpilogueSpec {
+    int hidden = 0;
+    int num_max_tokens_per_rank = 0;
+    int num_experts = 0;
+    int num_topk = 0;
+    int num_sms = 0;
+    int num_threads = 0;
+    int smem_bytes = 0;
+    int num_warps = 0;
+    int reduction_unroll_factor = 0;
     int num_scaleout_ranks = 1;
     int num_scaleup_ranks = 1;
 };
@@ -44,6 +82,9 @@ struct CombineSpec {
 // be compared without changing the public ElasticBuffer API. It is sampled
 // when an ElasticBuffer is constructed.
 bool requested_by_environment();
+
+int requested_combine_unroll_factor(int hidden);
+int requested_combine_epilogue_warps(int default_warps);
 
 void launch_dispatch(const DispatchSpec& spec, void* x, void* sf,
                      int64_t* topk_idx, float* topk_weights,
@@ -58,6 +99,17 @@ void launch_dispatch(const DispatchSpec& spec, void* x, void* sf,
                      int scaleout_rank_idx, int scaleup_rank_idx,
                      cudaStream_t stream);
 
+void launch_dispatch_epilogue(const DispatchEpilogueSpec& spec, void* buffer,
+                              void* workspace,
+                              int* psum_num_recv_tokens_per_scaleup_rank,
+                              int* psum_num_recv_tokens_per_expert,
+                              void* recv_x, void* recv_sf,
+                              int64_t* recv_topk_idx, float* recv_topk_weights,
+                              int* recv_src_metadata, int* channel_linked_list,
+                              int num_recv_tokens, int recv_sf_token_stride,
+                              int recv_sf_hidden_stride, int scaleout_rank_idx,
+                              int scaleup_rank_idx, cudaStream_t stream);
+
 void launch_combine(const CombineSpec& spec, void* x, float* topk_weights,
                     int* src_metadata,
                     int* psum_num_recv_tokens_per_scaleup_rank,
@@ -66,6 +118,13 @@ void launch_combine(const CombineSpec& spec, void* x, float* topk_weights,
                     const transport::NcclContext& comm_ctx, void* buffer,
                     void* workspace, int scaleout_rank_idx,
                     int scaleup_rank_idx, cudaStream_t stream);
+
+void launch_combine_epilogue(const CombineEpilogueSpec& spec, void* combined_x,
+                             float* combined_topk_weights,
+                             int64_t* combined_topk_idx, void* recv_buffer,
+                             void* bias_0, void* bias_1,
+                             int num_combined_tokens, int scaleout_rank_idx,
+                             int scaleup_rank_idx, cudaStream_t stream);
 
 }  // namespace mooncake::elastic::jit
 

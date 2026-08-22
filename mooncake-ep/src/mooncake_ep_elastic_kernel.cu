@@ -93,6 +93,40 @@ inline int combine_epilogue_smem_bytes(int hidden, int num_warps) {
     return num_warps * static_cast<int>(token_layout.get_num_bytes<false>());
 }
 
+#if defined(USE_NCCL_DEVICE) && defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && \
+    !defined(MOONCAKE_EP_USE_MUSA)
+int fit_nccl_jit_warps(const char* kernel, int preferred_warps,
+                       int minimum_warps, int per_warp_smem_bytes,
+                       int reserved_smem_bytes, int available_smem_bytes) {
+    if (preferred_warps < minimum_warps || minimum_warps <= 0 ||
+        per_warp_smem_bytes <= 0 || reserved_smem_bytes < 0 ||
+        available_smem_bytes <= reserved_smem_bytes) {
+        throw std::invalid_argument(std::string("Invalid Mooncake EP NCCL JIT ") +
+                                    kernel + " launch geometry");
+    }
+    const int fitting_warps =
+        (available_smem_bytes - reserved_smem_bytes) / per_warp_smem_bytes;
+    const int selected_warps = std::min(preferred_warps, fitting_warps);
+    if (selected_warps < minimum_warps) {
+        throw std::invalid_argument(
+            std::string("Mooncake EP NCCL JIT ") + kernel +
+            " requires more dynamic shared memory for this hidden size");
+    }
+    return selected_warps;
+}
+
+int nccl_jit_dispatch_warps(int hidden, int elem_size, int num_sf_packs,
+                            int num_topk, int preferred_warps,
+                            int minimum_warps, int reserved_smem_bytes,
+                            int available_smem_bytes) {
+    const int per_warp_smem_bytes = dispatch_smem_bytes(
+        hidden, elem_size, num_sf_packs, num_topk, 1, 0, 0, 1);
+    return fit_nccl_jit_warps(
+        "dispatch", preferred_warps, minimum_warps, per_warp_smem_bytes,
+        reserved_smem_bytes, available_smem_bytes);
+}
+#endif
+
 inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
     device::CommCtx comm_ctx{};
     comm_ctx.rank = ctx.rank;
@@ -399,13 +433,16 @@ void configure_kernel_dynamic_smem_once(Kernel kernel, int device_id,
 #endif
 
 template <typename Kernel, typename... Args>
-void launch_cooperative(Kernel kernel, int device_id, int num_sms,
-                        int num_threads, int smem_bytes, cudaStream_t stream,
-                        Args... args) {
+void launch_cooperative_impl(Kernel kernel, int device_id, int num_sms,
+                             int num_threads, int smem_bytes,
+                             cudaStream_t stream,
+                             bool programmatic_stream_serialization,
+                             Args... args) {
 #ifndef MOONCAKE_EP_USE_MUSA
     configure_kernel_dynamic_smem_once(kernel, device_id, smem_bytes);
 #else
     (void)device_id;
+    (void)programmatic_stream_serialization;
 #endif
 #ifdef MOONCAKE_EP_USE_MUSA
     kernel<<<num_sms, num_threads, smem_bytes, stream>>>(args...);
@@ -414,13 +451,41 @@ void launch_cooperative(Kernel kernel, int device_id, int num_sms,
     cudaLaunchConfig_t cfg = {{num_sms, 1, 1}, {num_threads, 1, 1},
                               static_cast<unsigned int>(smem_bytes), stream,
                               nullptr, 0};
-    cudaLaunchAttribute attr[1];
+    cudaLaunchAttribute attr[2]{};
     attr[0].id = cudaLaunchAttributeCooperative;
     attr[0].val.cooperative = 1;
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+    if (programmatic_stream_serialization) {
+        attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[1].val.programmaticStreamSerializationAllowed = 1;
+    }
+#else
+    (void)programmatic_stream_serialization;
+#endif
     cfg.attrs = attr;
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+    cfg.numAttrs = programmatic_stream_serialization ? 2u : 1u;
+#else
     cfg.numAttrs = 1;
+#endif
     CUDA_RUNTIME_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
 #endif
+}
+
+template <typename Kernel, typename... Args>
+void launch_cooperative(Kernel kernel, int device_id, int num_sms,
+                        int num_threads, int smem_bytes, cudaStream_t stream,
+                        Args... args) {
+    launch_cooperative_impl(kernel, device_id, num_sms, num_threads, smem_bytes,
+                            stream, false, args...);
+}
+
+template <typename Kernel, typename... Args>
+void launch_cooperative_dependent(Kernel kernel, int device_id, int num_sms,
+                                  int num_threads, int smem_bytes,
+                                  cudaStream_t stream, Args... args) {
+    launch_cooperative_impl(kernel, device_id, num_sms, num_threads, smem_bytes,
+                            stream, true, args...);
 }
 
 [[noreturn]] void unsupported_elastic_config(const char* op, int hidden,
@@ -515,7 +580,20 @@ void launch_mooncake_elastic_dispatch_backend(
 #endif
     const bool effective_cached_mode = cached_mode || musa_use_prepared_slots;
     const int num_notify_warps = effective_cached_mode ? 0 : kElasticNumNotifyWarps;
-    const int num_dispatch_warps = Ops::kNumDispatchWarps;
+    int num_dispatch_warps = Ops::kNumDispatchWarps;
+#if defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && !defined(MOONCAKE_EP_USE_MUSA)
+    if constexpr (Ops::kIsNccl) {
+        if (ctx.use_nccl_jit) {
+            const int notify_smem_bytes = dispatch_smem_bytes(
+                hidden, elem_size, num_sf_packs, num_topk,
+                ctx.num_scaleup_ranks, num_experts, num_notify_warps, 0);
+            num_dispatch_warps = nccl_jit_dispatch_warps(
+                hidden, elem_size, num_sf_packs, num_topk,
+                Ops::kNumDispatchWarps, 1, notify_smem_bytes,
+                num_smem_bytes);
+        }
+    }
+#endif
     const int num_threads = (num_notify_warps + num_dispatch_warps) * 32;
     const int smem_bytes = std::max(
         num_smem_bytes,
@@ -538,22 +616,53 @@ void launch_mooncake_elastic_dispatch_backend(
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
         const bool hybrid_reuse_slot_indices = cached_mode;
+        const int hybrid_scaleout_warps = Ops::kNumHybridScaleoutWarps;
+        const int hybrid_forward_warps = Ops::kNumHybridForwardWarps;
+        bool hybrid_use_global_notify_workspace = false;
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+        if constexpr (Ops::kIsNccl) {
+            if (ctx.use_nccl_jit) {
+                const int data_smem_bytes = dispatch_smem_bytes(
+                    hidden, elem_size, num_sf_packs, num_topk,
+                    ctx.num_scaleout_ranks * ctx.num_scaleup_ranks,
+                    num_experts, 0,
+                    hybrid_scaleout_warps + hybrid_forward_warps);
+                if (data_smem_bytes > num_smem_bytes) {
+                    throw std::invalid_argument(
+                        "Mooncake EP NCCL JIT hybrid dispatch token staging "
+                        "exceeds dynamic shared memory");
+                }
+                hybrid_use_global_notify_workspace =
+                    num_notify_warps > 0 &&
+                    dispatch_smem_bytes(
+                        hidden, elem_size, num_sf_packs, num_topk,
+                        ctx.num_scaleout_ranks * ctx.num_scaleup_ranks,
+                        num_experts, num_notify_warps,
+                        hybrid_scaleout_warps + hybrid_forward_warps) >
+                        num_smem_bytes;
+            }
+        }
+#endif
         const int hybrid_dispatch_warps =
-            Ops::kNumHybridScaleoutWarps + Ops::kNumHybridForwardWarps;
+            hybrid_scaleout_warps + hybrid_forward_warps;
         const int hybrid_threads =
             (num_notify_warps + hybrid_dispatch_warps) * 32;
         const int hybrid_smem_bytes = std::max(
             num_smem_bytes,
             dispatch_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
-                                ctx.num_scaleout_ranks * ctx.num_scaleup_ranks,
-                                num_experts, num_notify_warps,
+                                ctx.num_scaleout_ranks *
+                                    ctx.num_scaleup_ranks,
+                                num_experts,
+                                hybrid_use_global_notify_workspace
+                                    ? 0
+                                    : num_notify_warps,
                                 hybrid_dispatch_warps));
 
 #ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
         if constexpr (Ops::kIsNccl) {
             if (ctx.use_nccl_jit) {
                 if (expert_alignment != 1 || do_cpu_sync ||
-                    num_channels_per_sm != Ops::kNumHybridForwardWarps ||
+                    num_channels_per_sm != hybrid_forward_warps ||
                     token_metadata_at_forward == nullptr) {
                     throw std::invalid_argument(
                         "Mooncake EP NCCL JIT received an unsupported hybrid "
@@ -569,6 +678,11 @@ void launch_mooncake_elastic_dispatch_backend(
                 spec.num_notify_warps = num_notify_warps;
                 spec.num_threads = hybrid_threads;
                 spec.smem_bytes = hybrid_smem_bytes;
+                spec.num_dispatch_warps = num_dispatch_warps;
+                spec.num_hybrid_scaleout_warps = hybrid_scaleout_warps;
+                spec.num_hybrid_forward_warps = hybrid_forward_warps;
+                spec.use_global_notify_workspace =
+                    hybrid_use_global_notify_workspace;
                 spec.num_scaleout_ranks = ctx.num_scaleout_ranks;
                 spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
                 spec.reuse_slot_indices = cached_mode;
@@ -702,6 +816,9 @@ void launch_mooncake_elastic_dispatch_backend(
             spec.num_notify_warps = num_notify_warps;
             spec.num_threads = num_threads;
             spec.smem_bytes = smem_bytes;
+            spec.num_dispatch_warps = num_dispatch_warps;
+            spec.num_hybrid_scaleout_warps = Ops::kNumHybridScaleoutWarps;
+            spec.num_hybrid_forward_warps = Ops::kNumHybridForwardWarps;
             spec.num_scaleout_ranks = 1;
             spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
             spec.reuse_slot_indices = reuse_slot_indices;
@@ -854,11 +971,52 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
     bool cached_mode,
     const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
-    const int num_threads = kNumEpilogueWarps * 32;
+    int num_epilogue_warps = kNumEpilogueWarps;
+#if defined(USE_NCCL_DEVICE) && defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && \
+    !defined(MOONCAKE_EP_USE_MUSA)
+    if (ctx.backend == ElasticTransportBackend::kNccl && ctx.use_nccl_jit) {
+        const int per_warp_smem_bytes = dispatch_epilogue_smem_bytes(
+            hidden, elem_size, num_sf_packs, num_topk, 1);
+        num_epilogue_warps = fit_nccl_jit_warps(
+            "dispatch epilogue", kNumEpilogueWarps, 1,
+            per_warp_smem_bytes, 0, num_smem_bytes);
+    }
+#endif
+    const int num_threads = num_epilogue_warps * 32;
     const int smem_bytes = std::max(
         num_smem_bytes,
         dispatch_epilogue_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
-                                     kNumEpilogueWarps));
+                                     num_epilogue_warps));
+
+#if defined(USE_NCCL_DEVICE) && defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && \
+    !defined(MOONCAKE_EP_USE_MUSA)
+    if (ctx.backend == ElasticTransportBackend::kNccl && ctx.use_nccl_jit) {
+        elastic::jit::DispatchEpilogueSpec spec;
+        spec.hidden_bytes = hidden * elem_size;
+        spec.num_sf_packs = num_sf_packs;
+        spec.num_max_tokens_per_rank = num_max_tokens_per_rank;
+        spec.num_experts = num_experts;
+        spec.num_topk = num_topk;
+        spec.num_sms = num_epilogue_sms;
+        spec.num_threads = num_threads;
+        spec.smem_bytes = smem_bytes;
+        spec.num_channels =
+            ctx.num_scaleout_ranks == 1 ? 1 : num_channels;
+        spec.num_warps = num_epilogue_warps;
+        spec.num_scaleout_ranks = ctx.num_scaleout_ranks;
+        spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
+        spec.do_expand = do_expand;
+        spec.cached_mode = !do_expand && cached_mode;
+        elastic::jit::launch_dispatch_epilogue(
+            spec, ctx.buffer, ctx.workspace,
+            psum_num_recv_tokens_per_scaleup_rank,
+            psum_num_recv_tokens_per_expert, recv_x, recv_sf, recv_topk_idx,
+            recv_topk_weights, recv_src_metadata, channel_linked_list,
+            num_recv_tokens, recv_sf_token_stride, recv_sf_hidden_stride,
+            ctx.scaleout_rank_idx, ctx.scaleup_rank_idx, stream);
+        return;
+    }
+#endif
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
@@ -877,7 +1035,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
                     elastic::dispatch_copy_epilogue_impl<                      \
                         false, false, 0, C, kNumEpilogueWarps, SO, SU,  \
                         kHiddenBytes, kNumSFPacks, M, E, K>);                  \
-            launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,          \
+            launch_cooperative_dependent(kernel, ctx.device_id, num_epilogue_sms, num_threads, \
                                smem_bytes, stream,                               \
                                ctx.buffer, ctx.workspace,                      \
                                psum_num_recv_tokens_per_scaleup_rank,          \
@@ -938,7 +1096,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
                 elastic::dispatch_copy_epilogue_impl<                          \
                     false, false, 0, 1, kNumEpilogueWarps, 1, R,        \
                     kHiddenBytes, kNumSFPacks, M, E, K>);                      \
-        launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,              \
+        launch_cooperative_dependent(kernel, ctx.device_id, num_epilogue_sms, num_threads,     \
                            smem_bytes, stream,                                   \
                            ctx.buffer, ctx.workspace,                          \
                            psum_num_recv_tokens_per_scaleup_rank,              \
@@ -1023,16 +1181,49 @@ void* launch_mooncake_elastic_combine_backend(
     int num_channels, bool use_expanded_layout, bool allow_multiple_reduction,
     const ElasticLaunchContext& ctx, const typename Ops::Context& comm_ctx,
     cudaStream_t stream) {
-    const int num_threads = Ops::kNumCombineWarps * 32;
+    int num_combine_warps = Ops::kNumCombineWarps;
+#if defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && !defined(MOONCAKE_EP_USE_MUSA)
+    if constexpr (Ops::kIsNccl) {
+        if (ctx.use_nccl_jit) {
+            num_combine_warps = fit_nccl_jit_warps(
+                "combine", Ops::kNumCombineWarps, 1,
+                combine_smem_bytes(hidden, num_topk, 1), 0,
+                num_smem_bytes);
+        }
+    }
+#endif
+    const int num_threads = num_combine_warps * 32;
     const int smem_bytes = std::max(
-        num_smem_bytes, combine_smem_bytes(hidden, num_topk, Ops::kNumCombineWarps));
+        num_smem_bytes,
+        combine_smem_bytes(hidden, num_topk, num_combine_warps));
     (void)token_metadata_at_forward;
     (void)channel_linked_list;
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
+        int hybrid_scaleup_warps = Ops::kNumHybridScaleupWarps;
+        const int hybrid_forward_warps = Ops::kNumHybridForwardWarps;
+#ifdef MOONCAKE_EP_ENABLE_NCCL_JIT
+        if constexpr (Ops::kIsNccl) {
+            if (ctx.use_nccl_jit) {
+                constexpr int kMaxWarpsPerBlock = 1024 / 32;
+                const int fitting_hybrid_warps = fit_nccl_jit_warps(
+                    "hybrid combine",
+                    std::min(Ops::kNumHybridScaleupWarps +
+                                 hybrid_forward_warps,
+                             kMaxWarpsPerBlock),
+                    hybrid_forward_warps + 4,
+                    combine_smem_bytes(hidden, num_topk, 1), 0,
+                    num_smem_bytes);
+                // Keep the role boundary aligned to Blackwell's four-warp
+                // register-allocation group when JIT reduces the launch width.
+                hybrid_scaleup_warps =
+                    ((fitting_hybrid_warps - hybrid_forward_warps) / 4) * 4;
+            }
+        }
+#endif
         const int hybrid_combine_warps =
-            Ops::kNumHybridScaleupWarps + Ops::kNumHybridForwardWarps;
+            hybrid_scaleup_warps + hybrid_forward_warps;
         const int hybrid_threads = hybrid_combine_warps * 32;
         const int hybrid_smem_bytes = std::max(
             num_smem_bytes,
@@ -1057,6 +1248,9 @@ void* launch_mooncake_elastic_combine_backend(
                 spec.num_sms = num_sms;
                 spec.num_threads = hybrid_threads;
                 spec.smem_bytes = hybrid_smem_bytes;
+                spec.num_combine_warps = num_combine_warps;
+                spec.num_hybrid_scaleup_warps = hybrid_scaleup_warps;
+                spec.num_hybrid_forward_warps = hybrid_forward_warps;
                 spec.num_scaleout_ranks = ctx.num_scaleout_ranks;
                 spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
                 elastic::jit::launch_combine(
@@ -1132,6 +1326,9 @@ void* launch_mooncake_elastic_combine_backend(
             spec.num_sms = num_sms;
             spec.num_threads = num_threads;
             spec.smem_bytes = smem_bytes;
+            spec.num_combine_warps = num_combine_warps;
+            spec.num_hybrid_scaleup_warps = Ops::kNumHybridScaleupWarps;
+            spec.num_hybrid_forward_warps = Ops::kNumHybridForwardWarps;
             spec.num_scaleout_ranks = 1;
             spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
             elastic::jit::launch_combine(
@@ -1223,15 +1420,59 @@ void launch_mooncake_elastic_combine_reduce_epilogue_backend(
     bool use_expanded_layout,
     bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
     cudaStream_t stream) {
-    const int num_threads = kNumEpilogueWarps * 32;
+    int num_epilogue_warps = kNumEpilogueWarps;
+#if defined(USE_NCCL_DEVICE) && defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && \
+    !defined(MOONCAKE_EP_USE_MUSA)
+    if (ctx.backend == ElasticTransportBackend::kNccl && ctx.use_nccl_jit) {
+        const int safe_warps = fit_nccl_jit_warps(
+            "combine epilogue", kNumEpilogueWarps, 1,
+            combine_epilogue_smem_bytes(hidden, 1), 0, num_smem_bytes);
+        num_epilogue_warps =
+            elastic::jit::requested_combine_epilogue_warps(safe_warps);
+        fit_nccl_jit_warps(
+            "combine epilogue", num_epilogue_warps, num_epilogue_warps,
+            combine_epilogue_smem_bytes(hidden, 1), 0, num_smem_bytes);
+    }
+#endif
+    const int num_threads = num_epilogue_warps * 32;
     const int smem_bytes = std::max(
-        num_smem_bytes, combine_epilogue_smem_bytes(hidden, kNumEpilogueWarps));
+        num_smem_bytes,
+        combine_epilogue_smem_bytes(hidden, num_epilogue_warps));
+
+#if defined(USE_NCCL_DEVICE) && defined(MOONCAKE_EP_ENABLE_NCCL_JIT) && \
+    !defined(MOONCAKE_EP_USE_MUSA)
+    if (ctx.backend == ElasticTransportBackend::kNccl && ctx.use_nccl_jit) {
+        if (use_expanded_layout || !allow_multiple_reduction) {
+            throw std::invalid_argument(
+                "Mooncake EP NCCL JIT received an unsupported combine "
+                "epilogue configuration");
+        }
+        elastic::jit::CombineEpilogueSpec spec;
+        spec.hidden = hidden;
+        spec.num_max_tokens_per_rank = num_max_tokens_per_rank;
+        spec.num_experts = num_experts;
+        spec.num_topk = num_topk;
+        spec.num_sms = num_epilogue_sms;
+        spec.num_threads = num_threads;
+        spec.smem_bytes = smem_bytes;
+        spec.num_warps = num_epilogue_warps;
+        spec.reduction_unroll_factor =
+            elastic::jit::requested_combine_unroll_factor(hidden);
+        spec.num_scaleout_ranks = ctx.num_scaleout_ranks;
+        spec.num_scaleup_ranks = ctx.num_scaleup_ranks;
+        elastic::jit::launch_combine_epilogue(
+            spec, combined_x, combined_topk_weights, combined_topk_idx,
+            reduce_buffer, bias_0, bias_1, num_combined_tokens,
+            ctx.scaleout_rank_idx, ctx.scaleup_rank_idx, stream);
+        return;
+    }
+#endif
 
 #define LAUNCH_COMBINE_EPILOGUE(H, E, K, M, S, SO, SU)                         \
     do {                                                                       \
         auto kernel = elastic::combine_reduce_epilogue_impl<                   \
             false, true, 0, kNumEpilogueWarps, SO, SU, H, M, E, K>;     \
-        launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,              \
+        launch_cooperative_dependent(kernel, ctx.device_id, num_epilogue_sms, num_threads,     \
                            smem_bytes, stream,                                   \
                            static_cast<nv_bfloat16*>(combined_x),              \
                            combined_topk_weights, combined_topk_idx,           \
