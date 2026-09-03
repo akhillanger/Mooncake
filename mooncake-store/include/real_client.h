@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -646,6 +647,19 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
+    using LocalDiskOffloadObjects =
+        std::unordered_map<std::string, std::vector<Slice>>;
+    using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
+        const std::string &, LocalDiskOffloadObjects &)>;
+
+    // Dependency-injected overload used to verify routing decisions without
+    // requiring multiple live SSD offload servers.
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const LocalDiskOffloadReader &local_disk_reader);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
         const std::vector<std::string> &keys,
@@ -801,9 +815,9 @@ class RealClient : public PyClient {
 
     /**
      * @brief Mount a shared memory file region and return segment ids.
-     *        If size > max_mr_size, it will be split into multiple chunks
-     *        and mounted separately. RealClient will open(path) + mmap
-     *        internally for each chunk.
+     *        Protocols with a registration limit split larger regions into
+     *        multiple chunks. RealClient will open(path) + mmap internally
+     *        for each chunk.
      */
     int mountSegment(const std::string &path, size_t offset, size_t size,
                      const std::string &protocol, const std::string &location,
@@ -818,7 +832,7 @@ class RealClient : public PyClient {
 
     /**
      * @brief Allocate memory internally and mount segments to master.
-     *        If size > max_mr_size, it will be split into multiple chunks.
+     *        Protocols with a registration limit split larger regions.
      *        Memory is allocated via allocate_buffer_allocator_memory.
      *        The actual allocated size (aligned up to Slab::kSize) is written
      *        to out_allocated_size if non-null.
@@ -834,6 +848,14 @@ class RealClient : public PyClient {
      */
     int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
                               uint64_t grace_period_seconds = 0);
+
+    /**
+     * @brief Deregister this store's disk tier from the master and wait out a
+     * grace period, so a planned shutdown stops being advertised as an owner
+     * of offloaded keys before it stops serving them. No-op when SSD offload
+     * is not enabled on this client.
+     */
+    int drainLocalDiskSegment(uint64_t grace_period_seconds = 0);
 
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;

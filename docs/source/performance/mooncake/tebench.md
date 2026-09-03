@@ -197,6 +197,20 @@ computed from each class's actual transfer size.
 `--qos_classes_json`, and the global `--tent_intent_type`. Non-default
 per-class intents and deadlines require the TENT backend.
 
+### 4.3 Per-Target Metrics
+
+Multi-target runs print one `[target-summary]` line per target. Use
+`--result_output_jsonl=<path>` to also append a schema-versioned JSON record for
+each benchmark configuration. The record keeps the aggregate operation, byte,
+and throughput totals plus each target's segment name, assigned thread count,
+completed operations, transferred bytes, throughput, and latency distribution.
+The aggregate throughput uses the pooled average worker duration, matching the
+existing `BW (GB/s)` table calculation.
+
+Targets with no assigned worker are retained with zero-valued metrics. This
+makes an under-provisioned run (`threads < targets`) visible instead of silently
+dropping targets from the result.
+
 ## 5. Runtime Configuration
 
 This section summarizes the key runtime options that control workload behavior,
@@ -260,7 +274,9 @@ Example:
   thus multiple transports — SHM for DRAM, NVLink for VRAM) concurrently.
   Empty falls back to `--seg_type` (single type, existing behavior). See
   Section 5.8 for usage and the multi-transport configuration it requires.
-* `--target_seg_name` : target segment name (empty → Target mode)
+* `--target_seg_name` : target segment name (empty → Target mode).
+  A comma-separated list enables multi-target initiator mode, and worker
+  threads are distributed across all listed target segments.
 
 **Scan ranges**
 
@@ -275,6 +291,54 @@ A test case is skipped when:
 ```
 block_size × batch_size × num_threads > total_buffer_size
 ```
+
+**Multi-target initiator**
+
+Use a comma-separated `--target_seg_name` value when one initiator process
+should send traffic to multiple target segments:
+
+```bash
+./tebench \
+  --backend=tent \
+  --metadata_type=p2p \
+  --target_seg_name=<SEG_A>,<SEG_B>,<SEG_C> \
+  --op_type=read \
+  --start_num_threads=3 \
+  --max_num_threads=3
+```
+
+Thread `i` selects target `i % target_count`. Within the selected target, the
+local target-thread index is `i / target_count`, so increasing the thread count
+spreads traffic across targets before advancing to the next buffer slot inside
+each target. `--target_gpu_id` shifts the per-target buffer slot and does not
+change the target selection order.
+
+For multi-node benchmarks, tebench intentionally stays at the endpoint level:
+each process publishes its own segment, and an external launcher decides which
+target segment list each initiator receives. This keeps M-to-N, fan-out,
+incast, and all-to-all topologies as different launch configurations over the
+same comma-separated `--target_seg_name` primitive.
+
+For multiple initiator processes sharing the same target segment, use
+`--target_offset` and `--target_range_size` to partition the remote address
+space. The range size is relative to each initiator; tebench also validates that
+`target_offset + relative_offset + transfer_size` stays inside the actual target
+buffer.
+
+```bash
+# Initiator 0 uses [0, 512MiB)
+./tebench --target_seg_name=<SEG> --target_offset=0 --target_range_size=536870912
+
+# Initiator 1 uses [512MiB, 1GiB)
+./tebench --target_seg_name=<SEG> --target_offset=536870912 --target_range_size=536870912
+```
+
+For read-only verification with multiple readers, first write deterministic data
+using `--op_type=write_seed`, then run readers with `--op_type=read_verify`
+against the same target range. `read_verify` performs pure READs and validates
+the local buffer without modifying the remote data. Do not combine these modes
+with `--check_consistency`; `--check_consistency` remains the existing
+WRITE→READ self-check mode.
 
 ---
 
@@ -321,6 +385,8 @@ gpu_id + thread_id
 * `--qos_link_capacity_gbps` : measured usable link capacity in decimal GB/s
 * `--qos_output_jsonl` : append one schema-versioned JSON object per benchmark
   configuration
+* `--result_output_jsonl` : append aggregate and per-target metrics for each
+  benchmark configuration
 
 QoS mode intentionally requires a fixed thread count. Sweep offered load by
 running explicit cases with different class thread allocations so every output

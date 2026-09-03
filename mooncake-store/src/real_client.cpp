@@ -24,7 +24,7 @@
 #include "config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
-#include "environ.h"
+#include "client_auto_port_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -37,6 +37,7 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "version.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -64,10 +65,45 @@ namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
+size_t DivideRoundUp(size_t value, size_t divisor) {
+    return value / divisor + (value % divisor != 0);
+}
+
+size_t GetNextSegmentSize(size_t remaining,
+                          const std::optional<size_t> &split_limit,
+                          size_t alignment) {
+    if (!split_limit.has_value()) return remaining;
+    const size_t aligned_limit = (*split_limit / alignment) * alignment;
+    if (aligned_limit == 0) return 0;
+    const size_t segment_count = DivideRoundUp(remaining, aligned_limit);
+    const size_t balanced_size = DivideRoundUp(remaining, segment_count);
+    return std::min(remaining,
+                    DivideRoundUp(balanced_size, alignment) * alignment);
+}
+
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
     return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
            protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
 }
+
+#ifdef USE_ASCEND_DIRECT
+// Split standalone store capacity across NPUs: cap each mount at total/n.
+size_t AgentModeStoreChunkCap(size_t total_size) {
+    const uint32_t n = ContextManager::getInstance().getDeviceCount();
+    if (n <= 1 || total_size == 0) {
+        return 0;
+    }
+    return total_size / n;
+}
+
+bool RestoreAgentModeDeviceZero() {
+    if (!ContextManager::getInstance().setCurrentContext(0)) {
+        LOG(ERROR) << "Failed to restore current context for device 0";
+        return false;
+    }
+    return true;
+}
+#endif
 
 std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
     void *ptr, size_t size, const std::string &protocol,
@@ -779,25 +815,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         client_ = *client_opt;
     } else {
         // Auto port binding with retry on metadata registration failure
-        const int kMaxRetries =
-            Environ::GetInt("MC_STORE_CLIENT_SETUP_RETRIES", 20);
-        const int rawMinPort =
-            Environ::GetInt("MC_STORE_CLIENT_MIN_PORT", 12300);
-        const int rawMaxPort =
-            Environ::GetInt("MC_STORE_CLIENT_MAX_PORT", 14300);
-        constexpr int kDefaultMinPort = 12300;
-        constexpr int kDefaultMaxPort = 14300;
-        auto [minPort, maxPort] = ValidatePortRange(
-            rawMinPort, rawMaxPort, kDefaultMinPort, kDefaultMaxPort);
+        const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
         bool success = false;
 
-        for (int retry = 0; retry < kMaxRetries; ++retry) {
+        for (int retry = 0; retry < auto_port_config.max_retries; ++retry) {
             // Create port binder to hold a port
-            port_binder_ = std::make_unique<AutoPortBinder>(minPort, maxPort);
+            port_binder_ = std::make_unique<AutoPortBinder>(
+                auto_port_config.min_port, auto_port_config.max_port);
             int port = port_binder_->getPort();
             if (port < 0) {
-                LOG(WARNING) << "Failed to bind available port, retry "
-                             << (retry + 1) << "/" << kMaxRetries;
+                LOG(WARNING)
+                    << "Failed to bind available port, retry " << (retry + 1)
+                    << "/" << auto_port_config.max_retries;
                 port_binder_.reset();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
@@ -821,14 +850,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             // Failed to create client (possibly due to metadata registration
             // conflict), release port and retry with a different port
             LOG(WARNING) << "Failed to create client on port " << port
-                         << ", retry " << (retry + 1) << "/" << kMaxRetries;
+                         << ", retry " << (retry + 1) << "/"
+                         << auto_port_config.max_retries;
             port_binder_.reset();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (!success) {
-            LOG(ERROR) << "Failed to create client after " << kMaxRetries
-                       << " retries";
+            LOG(ERROR) << "Failed to create client after "
+                       << auto_port_config.max_retries << " retries";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
@@ -868,9 +898,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    // If global_segment_size is 0, skip mount segment;
-    // If global_segment_size is larger than max_mr_size, split to multiple
-    // mapped_shms.
+    // If global_segment_size is 0, skip mount segment. Transports with a
+    // registration limit split it into balanced chunks; other transports use
+    // one segment.
     if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
@@ -895,9 +925,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
     } else {
-        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
+
+        auto split_limit = GetTransportRegistrationLimit(protocol);
+        const size_t alignment = facebook::cachelib::Slab::kSize;
+#ifdef USE_ASCEND_DIRECT
+        if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
+            const size_t cap = AgentModeStoreChunkCap(global_segment_size);
+            if (cap > 0) {
+                if (!split_limit.has_value() || cap < *split_limit) {
+                    split_limit = cap;
+                }
+                LOG(INFO) << "Agent-mode store chunk cap: " << cap
+                          << " bytes across "
+                          << ContextManager::getInstance().getDeviceCount()
+                          << " device(s)";
+            }
+        }
+#endif
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
         // global_segment across them for full NIC utilization.
@@ -921,7 +967,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             protocol == "rdma" && should_use_hugepage;
 
         while (global_segment_size > 0) {
-            size_t segment_size = std::min(global_segment_size, max_mr_size);
+            size_t segment_size =
+                GetNextSegmentSize(global_segment_size, split_limit, alignment);
+            if (segment_size == 0) {
+                LOG(ERROR) << "Registration limit is smaller than segment "
+                              "alignment";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
             global_segment_size -= segment_size;
 
             size_t mapped_size = segment_size;
@@ -963,8 +1015,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            current_glbseg_size += mapped_size;
-            LOG(INFO) << "Mounting segment: " << mapped_size << " bytes, "
+            const size_t mount_size =
+                split_limit.has_value() ? segment_size : mapped_size;
+            current_glbseg_size += mount_size;
+            LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
@@ -1010,7 +1064,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto pinned_region =
                 TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, mount_size, protocol, seg_location);
             if (!mount_result.has_value()) {
                 if (!ReleasePinnedRegionForFree(pinned_region,
                                                 "Store setup segment")) {
@@ -1028,6 +1082,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (total_glbseg_size == 0) {
             LOG(INFO) << "Global segment size is 0, skip mounting segment";
         }
+#ifdef USE_ASCEND_DIRECT
+        if (protocol == "ascend" && globalConfig().ascend_agent_mode &&
+            !RestoreAgentModeDeviceZero()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#endif
     }
 
     // Start IPC server to accept FD from dummy clients
@@ -1076,6 +1136,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+        // The dangling-replica heal in Client::Put needs an existence check
+        // against this process's offload files, which only the FileStorage
+        // owns. true: backing file is gone, false: present, nullopt: unknown.
+        std::weak_ptr<FileStorage> weak_storage = file_storage_;
+        client_->SetLocalDiskProbe(
+            [weak_storage](const std::string &key) -> std::optional<bool> {
+                auto storage = weak_storage.lock();
+                if (!storage) {
+                    return std::nullopt;
+                }
+                auto exists = storage->Exists(key);
+                if (!exists) {
+                    return std::nullopt;
+                }
+                return !*exists;
+            });
     }
     client_requester_ = std::make_shared<ClientRequester>();
     const bool should_start_http_server =
@@ -1214,8 +1290,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
     // A size of 0 keeps the pure client/server setup semantics.
-    // global_segment_size is a total capacity and may exceed max_mr_size; the
-    // setup path splits it into mountable chunks below.
+    // global_segment_size is a total capacity; protocols with a registration
+    // limit split it into mountable chunks below.
     auto validate_min_size = [](const char *key, size_t value) {
         if (value != 0 && value < MIN_SEGMENT_SIZE) {
             LOG(ERROR) << "Invalid " << key << ": " << value
@@ -1372,18 +1448,7 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         return -1;
     }
 
-    size_t max_mr_size = globalConfig().max_mr_size;
-    if (max_mr_size == 0) {
-        LOG(ERROR) << "Invalid max_mr_size: 0";
-        return -1;
-    }
-
     size_t page_size = sysconf(_SC_PAGESIZE);
-    if (max_mr_size < page_size) {
-        LOG(ERROR) << "max_mr_size " << max_mr_size
-                   << " is smaller than page_size " << page_size;
-        return -1;
-    }
 
     int fd = open(path.c_str(), O_RDWR);
     if (fd < 0) {
@@ -1412,14 +1477,15 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         return -1;
     }
 
-    size_t aligned_max_chunk = (max_mr_size / page_size) * page_size;
+    const auto split_limit = GetTransportRegistrationLimit(protocol);
     size_t remaining = size;
     size_t current_offset = offset;
     std::vector<std::string> mounted_ids;
     std::vector<MountedSegmentRecord> mounted_records;
 
     while (remaining > 0) {
-        size_t chunk_size = std::min(remaining, aligned_max_chunk);
+        size_t chunk_size =
+            GetNextSegmentSize(remaining, split_limit, page_size);
         if (chunk_size == 0) break;
 
         void *ptr = mmap(nullptr, chunk_size, PROT_READ | PROT_WRITE,
@@ -1625,34 +1691,12 @@ int RealClient::allocateAndMountSegment(
         return -1;
     }
 
-    size_t max_mr_size = globalConfig().max_mr_size;
-    if (max_mr_size == 0) {
-        LOG(ERROR) << "Invalid max_mr_size: 0";
-        return -1;
-    }
-
     if (size == 0) {
         LOG(ERROR) << "size is 0";
         return -1;
     }
 
     const size_t slab_size = facebook::cachelib::Slab::kSize;
-    size_t page_size = sysconf(_SC_PAGESIZE);
-    if (max_mr_size < page_size) {
-        LOG(ERROR) << "max_mr_size " << max_mr_size
-                   << " is smaller than page_size " << page_size;
-        return -1;
-    }
-
-    size_t aligned_max_chunk = (max_mr_size / page_size) * page_size;
-    if (aligned_max_chunk < slab_size) {
-        LOG(ERROR) << "max_mr_size " << max_mr_size
-                   << " is smaller than slab_size " << slab_size;
-        return -1;
-    }
-    // Round down chunk size to slab_size multiple
-    aligned_max_chunk = (aligned_max_chunk / slab_size) * slab_size;
-
     // Check overflow before aligning up to slab_size
     if (size > std::numeric_limits<size_t>::max() - (slab_size - 1)) {
         LOG(ERROR) << "size " << size
@@ -1662,12 +1706,14 @@ int RealClient::allocateAndMountSegment(
     // Round up total size to slab_size multiple
     size_t aligned_total_size =
         ((size + slab_size - 1) / slab_size) * slab_size;
+    const auto split_limit = GetTransportRegistrationLimit(protocol);
     size_t remaining = aligned_total_size;
     std::vector<std::string> mounted_ids;
     std::vector<AllocatedSegmentRecord> allocated_records;
 
     while (remaining > 0) {
-        size_t chunk_size = std::min(remaining, aligned_max_chunk);
+        size_t chunk_size =
+            GetNextSegmentSize(remaining, split_limit, slab_size);
         if (chunk_size == 0) break;
 
         void *ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
@@ -1797,6 +1843,21 @@ int RealClient::unmountAndFreeSegment(
     return first_error;
 }
 
+int RealClient::drainLocalDiskSegment(uint64_t grace_period_seconds) {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+    if (!file_storage_) {
+        LOG(WARNING) << "action=drain_local_disk_segment, "
+                        "warn=ssd_offload_not_enabled";
+        return 0;
+    }
+    auto result =
+        file_storage_->DrainLocalDiskSegment(grace_period_seconds * 1000);
+    return result ? 0 : -1;
+}
+
 int RealClient::health_check() {
     if (closed_.load()) return HC_NOT_INITIALIZED;
     if (!client_) return HC_NOT_INITIALIZED;
@@ -1874,6 +1935,15 @@ int RealClient::start_http_server(int port) {
             }
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, std::move(*result));
+        });
+
+    http_server_->set_http_handler<GET>(
+        "/version", [](coro_http_request &req, coro_http_response &resp) {
+            std::string body = "{\"version\":\"" + GetMooncakeStoreVersion() +
+                               "\",\"display_version\":\"" +
+                               std::string(MOONCAKE_DISPLAY_VERSION) + "\"}";
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
     auto ec = http_server_->async_start();
@@ -4995,6 +5065,36 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
+                   << ", buffers=" << buffers.size()
+                   << ", sizes=" << sizes.size();
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.empty()) {
+        return {};
+    }
+
+    const auto query_results = client_->BatchQuery(keys);
+    return batch_get_into_internal(
+        keys, buffers, sizes, query_results,
+        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
+            return batch_get_into_offload_object_internal(endpoint, objects);
+        });
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_internal(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+    const LocalDiskOffloadReader &local_disk_reader) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -5003,10 +5103,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+    if (keys.size() != buffers.size() || keys.size() != sizes.size() ||
+        keys.size() != query_results.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << buffers.size()
-                   << ", sizes=" << sizes.size();
+                   << ", sizes=" << sizes.size()
+                   << ", query_results=" << query_results.size();
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -5018,14 +5120,19 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return results;
     }
 
-    // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
-
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
         size_t original_index;
         QueryResult query_result;
+        std::vector<Slice> slices;
+        uint64_t total_size;
+    };
+    struct ValidLocalDiskKeyInfo {
+        std::string key;
+        size_t original_index;
+        QueryResult query_result;
+        Replica::Descriptor replica;
         std::vector<Slice> slices;
         uint64_t total_size;
     };
@@ -5039,7 +5146,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     };
 
     std::vector<ValidKeyInfo> valid_operations;
-    std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
+    std::unordered_map<std::string, ValidLocalDiskKeyInfo>
+        valid_local_disk_operations;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
@@ -5094,12 +5202,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             std::vector<Slice> key_slices;
             allocateSlices(key_slices, replica, buffers[i]);
             valid_local_disk_operations.emplace(
-                key,
-                ValidKeyInfo{.key = key,
-                             .original_index = i,
-                             .query_result = std::move(query_result_values),
-                             .slices = std::move(key_slices),
-                             .total_size = total_size});
+                key, ValidLocalDiskKeyInfo{
+                         .key = key,
+                         .original_index = i,
+                         .query_result = std::move(query_result_values),
+                         .replica = replica,
+                         .slices = std::move(key_slices),
+                         .total_size = total_size});
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
@@ -5239,21 +5348,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         offload_objects;
 
     for (const auto &op_it : valid_local_disk_operations) {
-        // Find the LOCAL_DISK replica from the list — replicas may be in
-        // any order from Master.
-        const Replica::Descriptor *replica_ptr = nullptr;
-        for (const auto &r : op_it.second.query_result.replicas) {
-            if (r.is_local_disk_replica()) {
-                replica_ptr = &r;
-                break;
-            }
-        }
-        if (!replica_ptr) {
-            LOG(ERROR) << "No LOCAL_DISK replica found for key: "
-                       << op_it.first;
-            continue;
-        }
-        const auto &replica = *replica_ptr;
+        const auto &replica = op_it.second.replica;
         auto [store_segment_it, _] = offload_objects.try_emplace(
             replica.get_local_disk_descriptor().transport_endpoint);
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
@@ -5264,7 +5359,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = batch_get_into_offload_object_internal(
+        auto batch_get_offload_result = local_disk_reader(
             offload_objects_it.first, offload_objects_it.second);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
@@ -6891,6 +6986,13 @@ ClientRequester::ClientRequester() {
     pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
     pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};
 
+    // Honour the same timeout overrides as the master pool. Without this the
+    // connect timeout stays at coro_rpc's built-in 30s, so a read that picks a
+    // peer which is gone blocks for connect_retry_count * 30s plus the waits
+    // between retries -- 91s with the defaults above -- and no configuration
+    // can shorten it. Defaults are unchanged when the variables are unset.
+    detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
+
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf, GetStoreRpcClientIoContextPool());
@@ -6946,6 +7048,10 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
+                if (result.error().code == coro_rpc::errc::timed_out) {
+                    LOG(ERROR) << "RPC call timed out: " << result.error().msg;
+                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }

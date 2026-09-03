@@ -15,8 +15,13 @@
 #ifndef WORKER_H
 #define WORKER_H
 
-#include <queue>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "config.h"
 #include "rdma_context.h"
@@ -41,7 +46,6 @@ class WorkerPool {
 
    private:
     using SliceList = std::vector<Transport::Slice *>;
-    const static int kShardCount = 8;
 
     // Enqueue slices that were prepared by another WorkerPool. Used for
     // local-NIC failure handoff: the original worker keeps the remote path
@@ -49,15 +53,21 @@ class WorkerPool {
     // worker queue.
     int submitPreparedPostSend(
         const std::vector<Transport::Slice *> &slice_list);
-    void enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
+    void enqueuePreparedSlices(const SliceList &slice_list,
                                uint64_t submitted_slice_count);
+    void enqueueSliceToOwner(Transport::Slice *slice);
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
 
     void performPostSend(int thread_id);
 
-    void performPollCq(int thread_id);
+    int performPollCq(int thread_id, bool defer_local_redispatch = false);
+    void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list,
+                            bool defer_local_redispatch = false);
 
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
-                    bool handoff_to_local_worker = false);
+                    bool handoff_to_local_worker = false,
+                    bool defer_local_redispatch = false);
 
     void transferWorker(int thread_id);
 
@@ -72,6 +82,7 @@ class WorkerPool {
     struct RailState {
         int error_count = 0;
         uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+        uint64_t last_error_ns = 0;   // Timestamp (ns) of the last error
     };
 
     void markRailFailed(const std::string &peer_nic_path,
@@ -129,6 +140,7 @@ class WorkerPool {
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
+    const int worker_count_;
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
@@ -150,12 +162,10 @@ class WorkerPool {
     std::mutex cond_mutex_;
     std::condition_variable cond_var_;
 
-    std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];
-    std::atomic<uint64_t> slice_queue_count_[kShardCount];
-    TicketLock slice_queue_lock_[kShardCount];
-
     std::vector<std::unordered_map<std::string, SliceList>>
         collective_slice_queue_;
+    std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
+    std::vector<std::mutex> worker_slice_queue_lock_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
@@ -166,6 +176,10 @@ class WorkerPool {
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause
+    // Errors further apart than this are not consecutive, so error_count is
+    // restarted. Without it a long-lived process accumulates isolated failures
+    // until an otherwise healthy rail is paused.
+    const static uint64_t kRailErrorWindowNs = 5000000000ull;  // 5 seconds
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 

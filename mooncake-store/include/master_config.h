@@ -141,6 +141,13 @@ struct MasterConfig {
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Dynamic MEMORY replica fanout for hot read-only objects.
+    // Kept intentionally small: mode + frequency window + max replicas.
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
+
     // KV Events publisher (RFC #1527) for cache-aware indexers.
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -242,6 +249,10 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -298,6 +309,13 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -487,6 +505,10 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -577,6 +599,13 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -694,6 +723,13 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -1129,6 +1165,8 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Zero denotes a directly constructed, supervisor-unmanaged service;
+    // HA supervisor serving paths always inject the acquired non-zero view.
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -1146,6 +1184,10 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -1232,6 +1274,13 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
