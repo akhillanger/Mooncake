@@ -441,9 +441,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     }
 
     const auto stream = currentCudaStream(streamTensor);
-    checkResult(GpuFn(args..., comm_, convertStream(stream),
-                      failed_ranks_hint.data(), failed_ranks_hint_count),
-                operation);
+    mooncakePgGpuCollectiveStatus_t raw_status = nullptr;
+    checkResult(
+        GpuFn(args..., comm_, convertStream(stream), failed_ranks_hint.data(),
+              failed_ranks_hint_count, &raw_status),
+        operation);
+    auto gpu_status = ownGpuCollectiveStatus(raw_status);
     // Clear a sticky error before recording the completion event and checking
     // capture state on the collective's stream.
     cudaGetLastError();
@@ -462,7 +465,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     }
     return c10::make_intrusive<MooncakeWorkCuda>(
         opType, std::move(event), std::move(failed_ranks_hint), work_tracker_,
-        std::move(keepAlive), is_captured);
+        std::move(keepAlive), is_captured, std::move(gpu_status));
 }
 
 template <auto CpuFn, auto GpuFn, typename... Args>
@@ -529,7 +532,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     TORCH_CHECK(tensors.size() == 1, kSingleTensorError);
     auto tensor = tensors.back();
     const int root = opts.rootRank + opts.rootTensor;
-    return launchCollective<mooncakePgBroadcastCpu, mooncakePgBroadcastGpu>(
+    return launchCollective<mooncakePgBroadcastCpu,
+                            mooncakePgBroadcastGpuWithStatus>(
         c10d::OpType::BROADCAST, "mooncakePgBroadcast", tensor, {tensor}, {},
         tensor.data_ptr(), tensor.data_ptr(), tensorCount(tensor),
         tensorType(tensor), root);
@@ -540,7 +544,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     TORCH_CHECK(tensors.size() == 1, kSingleTensorError);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, kSparseError);
     auto tensor = tensors.back();
-    return launchCollective<mooncakePgAllReduceCpu, mooncakePgAllReduceGpu>(
+    return launchCollective<mooncakePgAllReduceCpu,
+                            mooncakePgAllReduceGpuWithStatus>(
         c10d::OpType::ALLREDUCE, "mooncakePgAllReduce", tensor, {tensor}, {},
         tensor.data_ptr(), tensor.data_ptr(), tensorCount(tensor),
         tensorType(tensor), convertReduceOp(opts.reduceOp));
@@ -563,7 +568,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     keep_alive.insert(keep_alive.end(), outputs.begin(), outputs.end());
     auto post_completion =
         makeCopyBackToPeerTensors(packed_output, std::move(outputs));
-    return launchCollective<mooncakePgAllGatherCpu, mooncakePgAllGatherGpu>(
+    return launchCollective<mooncakePgAllGatherCpu,
+                            mooncakePgAllGatherGpuWithStatus>(
         c10d::OpType::ALLGATHER, "mooncakePgAllGather", input,
         std::move(keep_alive), std::move(post_completion), input.data_ptr(),
         packed_output.data_ptr(), tensorCount(input), tensorType(input));
@@ -575,7 +581,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     validateSingleBufferTensors(outputBuffer, inputBuffer,
                                 isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
 
-    return launchCollective<mooncakePgAllGatherCpu, mooncakePgAllGatherGpu>(
+    return launchCollective<mooncakePgAllGatherCpu,
+                            mooncakePgAllGatherGpuWithStatus>(
         c10d::OpType::_ALLGATHER_BASE, "mooncakePgAllGather", inputBuffer,
         {inputBuffer, outputBuffer}, {}, inputBuffer.data_ptr(),
         outputBuffer.data_ptr(), tensorCount(inputBuffer),
@@ -589,7 +596,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                                 isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
 
     return launchCollective<mooncakePgReduceScatterCpu,
-                            mooncakePgReduceScatterGpu>(
+                            mooncakePgReduceScatterGpuWithStatus>(
         c10d::OpType::_REDUCE_SCATTER_BASE, "mooncakePgReduceScatter",
         outputBuffer, {inputBuffer, outputBuffer}, {}, inputBuffer.data_ptr(),
         outputBuffer.data_ptr(), tensorCount(outputBuffer),
@@ -616,7 +623,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
                       outputTensors.end());
     auto post_completion =
         makeCopyBackToPeerTensors(packed_output, outputTensors);
-    return launchCollective<mooncakePgAllToAllCpu, mooncakePgAllToAllGpu>(
+    return launchCollective<mooncakePgAllToAllCpu,
+                            mooncakePgAllToAllGpuWithStatus>(
         c10d::OpType::ALLTOALL, "mooncakePgAllToAll", reference,
         std::move(keep_alive), std::move(post_completion),
         packed_input.data_ptr(), packed_output.data_ptr(),
@@ -649,7 +657,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall_base(
     validate_splits(inputSplitSizes, "input");
     validate_splits(outputSplitSizes, "output");
 
-    return launchCollective<mooncakePgAllToAllCpu, mooncakePgAllToAllGpu>(
+    return launchCollective<mooncakePgAllToAllCpu,
+                            mooncakePgAllToAllGpuWithStatus>(
         c10d::OpType::ALLTOALL_BASE, "mooncakePgAllToAll", inputBuffer,
         {inputBuffer, outputBuffer}, {}, inputBuffer.data_ptr(),
         outputBuffer.data_ptr(), static_cast<size_t>(peer_count),
@@ -672,19 +681,26 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     }
 
     const auto stream = c10::cuda::getCurrentCUDAStream();
-    checkResult(
-        mooncakePgBarrierGpu(comm_, convertStream(stream),
-                             failed_ranks_hint.data(), failed_ranks_hint_count),
-        "mooncakePgBarrierGpu");
+    mooncakePgGpuCollectiveStatus_t raw_status = nullptr;
+    checkResult(mooncakePgBarrierGpuWithStatus(
+                    comm_, convertStream(stream), failed_ranks_hint.data(),
+                    failed_ranks_hint_count, &raw_status),
+                "mooncakePgBarrierGpu");
+    auto gpu_status = ownGpuCollectiveStatus(raw_status);
     auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
-    if (at::cuda::currentStreamCaptureStatus() ==
-        c10::cuda::CaptureStatus::None) {
+    const bool stream_captured = at::cuda::currentStreamCaptureStatus() !=
+                                 c10::cuda::CaptureStatus::None;
+    const bool is_captured = gpu_status && stream_captured;
+    if (is_captured) {
+        work_tracker_->notifyCapture(true);
+    } else if (!stream_captured) {
         work_tracker_->evictCompleted();
     }
     return c10::make_intrusive<MooncakeBarrierWorkCuda>(
         c10d::OpType::BARRIER, std::move(event), std::move(failed_ranks_hint),
-        work_tracker_);
+        work_tracker_, std::vector<at::Tensor>{}, is_captured,
+        std::move(gpu_status));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
@@ -692,7 +708,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     TORCH_CHECK(tensors.size() == 1, kSingleTensorError);
     auto tensor = tensors.back();
     const int root = opts.rootRank + opts.rootTensor;
-    return launchCollective<mooncakePgReduceCpu, mooncakePgReduceGpu>(
+    return launchCollective<mooncakePgReduceCpu, mooncakePgReduceGpuWithStatus>(
         c10d::OpType::REDUCE, "mooncakePgReduce", tensor, {tensor}, {},
         tensor.data_ptr(), tensor.data_ptr(), tensorCount(tensor),
         tensorType(tensor), convertReduceOp(opts.reduceOp), root);
@@ -724,7 +740,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     auto post_completion = packed_output.defined() ? makeCopyBackToPeerTensors(
                                                          packed_output, outputs)
                                                    : std::function<void()>{};
-    return launchCollective<mooncakePgGatherCpu, mooncakePgGatherGpu>(
+    return launchCollective<mooncakePgGatherCpu, mooncakePgGatherGpuWithStatus>(
         c10d::OpType::GATHER, "mooncakePgGather", input, std::move(keep_alive),
         std::move(post_completion), input.data_ptr(),
         packed_output.defined() ? packed_output.data_ptr() : nullptr,
@@ -751,7 +767,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
 
     std::vector<at::Tensor> keep_alive{output, packed_input};
     keep_alive.insert(keep_alive.end(), inputs.begin(), inputs.end());
-    return launchCollective<mooncakePgScatterCpu, mooncakePgScatterGpu>(
+    return launchCollective<mooncakePgScatterCpu,
+                            mooncakePgScatterGpuWithStatus>(
         c10d::OpType::SCATTER, "mooncakePgScatter", output,
         std::move(keep_alive), {},
         packed_input.defined() ? packed_input.data_ptr() : nullptr,

@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_COMM_TYPES_H
 #define MOONCAKE_PG_COMM_TYPES_H
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -90,6 +91,12 @@ enum class GpuCollectiveBackend : uint8_t {
     Auto = 0,
     TransferEngine = 1,
     Nccl = 2,
+};
+
+// Independent of peer-failure hints: a collective may be aborted without
+// identifying a failed peer. Shared with Work objects after executor teardown.
+struct GpuCollectiveStatus {
+    std::atomic<bool> aborted{false};
 };
 
 class WorkCompletion {

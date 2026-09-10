@@ -58,6 +58,14 @@ std::any makeTrackedResources(Resources&&... resources) {
 
 }  // namespace
 
+GpuCollectiveStatusHandle ownGpuCollectiveStatus(
+    mooncakePgGpuCollectiveStatus_t status) {
+    if (!status) return {};
+    return GpuCollectiveStatusHandle(status, [](auto* value) {
+        (void)mooncakePgGpuCollectiveStatusDestroy(value);
+    });
+}
+
 FailedRanksHint FailedRanksHint::allocate(int size) {
     auto options =
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
@@ -216,10 +224,12 @@ MooncakeWorkCuda::MooncakeWorkCuda(c10d::OpType opType,
                                    FailedRanksHint failedRanksHint,
                                    std::shared_ptr<MooncakeWorkTracker> tracker,
                                    std::vector<at::Tensor> keepAlive,
-                                   bool is_captured)
+                                   bool is_captured,
+                                   GpuCollectiveStatusHandle gpu_status)
     : Work(-1, opType),
       event_(std::move(event)),
       is_captured_(is_captured),
+      gpu_status_(std::move(gpu_status)),
       failed_ranks_hint_(std::move(failedRanksHint)),
       tracker_(std::move(tracker)),
       keep_alive_(std::move(keepAlive)) {
@@ -233,15 +243,16 @@ MooncakeWorkCuda::~MooncakeWorkCuda() {
         // its references; the tracker owns them through shutdown.
         tracker_->notifyCapture(false);
         tracker_->retainUntilShutdown(makeTrackedResources(
-            std::move(event_), std::move(failed_ranks_hint_),
-            std::move(keep_alive_)));
+            std::move(event_), std::move(gpu_status_),
+            std::move(failed_ranks_hint_), std::move(keep_alive_)));
         return;
     }
 
     auto event = std::move(event_);
-    tracker_->retire(makeTrackedResources(std::move(failed_ranks_hint_),
-                                          std::move(keep_alive_)),
-                     [event = std::move(event)] { return event->query(); });
+    tracker_->retire(
+        makeTrackedResources(std::move(failed_ranks_hint_),
+                             std::move(keep_alive_), std::move(gpu_status_)),
+        [event = std::move(event)] { return event->query(); });
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds) {
@@ -274,6 +285,13 @@ bool MooncakeWorkCuda::getLocalSuccess() const {
     if (event_ && at::cuda::currentStreamCaptureStatus() ==
                       c10::cuda::CaptureStatus::None) {
         event_->synchronize();
+    }
+    if (gpu_status_) {
+        int aborted = 0;
+        checkResult(mooncakePgGpuCollectiveStatusGetAborted(gpu_status_.get(),
+                                                            &aborted),
+                    "mooncakePgGpuCollectiveStatusGetAborted");
+        if (aborted) return false;
     }
     return failed_ranks_hint_.isLocalSuccess();
 }

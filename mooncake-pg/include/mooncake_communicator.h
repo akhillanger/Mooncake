@@ -146,72 +146,80 @@ class MooncakeCommunicator {
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> broadcastGpu(const void* send_buffer, void* recv_buffer,
-                                size_t count, DataType datatype, int root,
-                                cudaStream_t stream, int32_t* failed_ranks_hint,
-                                size_t failed_ranks_hint_count);
+    PGResult<void> broadcastGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> allReduceCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, ReduceOp op, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> allReduceGpu(const void* send_buffer, void* recv_buffer,
-                                size_t count, DataType datatype, ReduceOp op,
-                                cudaStream_t stream, int32_t* failed_ranks_hint,
-                                size_t failed_ranks_hint_count);
+    PGResult<void> allReduceGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> allGatherCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> allGatherGpu(const void* send_buffer, void* recv_buffer,
-                                size_t count, DataType datatype,
-                                cudaStream_t stream, int32_t* failed_ranks_hint,
-                                size_t failed_ranks_hint_count);
+    PGResult<void> allGatherGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> reduceScatterCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, ReduceOp op, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> reduceScatterGpu(const void* send_buffer, void* recv_buffer,
-                                    size_t count, DataType datatype,
-                                    ReduceOp op, cudaStream_t stream,
-                                    int32_t* failed_ranks_hint,
-                                    size_t failed_ranks_hint_count);
+    PGResult<void> reduceScatterGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> allToAllCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> allToAllGpu(const void* send_buffer, void* recv_buffer,
-                               size_t count, DataType datatype,
-                               cudaStream_t stream, int32_t* failed_ranks_hint,
-                               size_t failed_ranks_hint_count);
+    PGResult<void> allToAllGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> barrierCpu(
         int32_t* failed_ranks_hint, size_t failed_ranks_hint_count);
-    PGResult<void> barrierGpu(cudaStream_t stream, int32_t* failed_ranks_hint,
-                              size_t failed_ranks_hint_count);
+    PGResult<void> barrierGpu(
+        cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> reduceCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, ReduceOp op, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> reduceGpu(const void* send_buffer, void* recv_buffer,
-                             size_t count, DataType datatype, ReduceOp op,
-                             int root, cudaStream_t stream,
-                             int32_t* failed_ranks_hint,
-                             size_t failed_ranks_hint_count);
+    PGResult<void> reduceGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> gatherCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> gatherGpu(const void* send_buffer, void* recv_buffer,
-                             size_t count, DataType datatype, int root,
-                             cudaStream_t stream, int32_t* failed_ranks_hint,
-                             size_t failed_ranks_hint_count);
+    PGResult<void> gatherGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> scatterCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> scatterGpu(const void* send_buffer, void* recv_buffer,
-                              size_t count, DataType datatype, int root,
-                              cudaStream_t stream, int32_t* failed_ranks_hint,
-                              size_t failed_ranks_hint_count);
+    PGResult<void> scatterGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
 
     PGResult<void> shutdown();
     std::vector<int32_t> getActiveRanks() const;

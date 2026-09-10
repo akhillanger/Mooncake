@@ -850,7 +850,8 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::broadcastCpu(
 PGResult<void> MooncakeCommunicator::broadcastGpu(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     int root, cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "broadcastGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::Broadcast));
     PG_TRY(auto bytes, getByteCount(count, datatype));
@@ -866,7 +867,7 @@ PGResult<void> MooncakeCommunicator::broadcastGpu(
         nccl_collectives_->supports(datatype)) {
         const void* input = is_root ? send_buffer : recv_buffer;
         return nccl_collectives_->broadcast(input, recv_buffer, count, datatype,
-                                            root, stream);
+                                            root, stream, status);
     }
     worker_->putTaskCuda(
         OpType::Broadcast, bytes, root, meta_, stream, failed_ranks_hint,
@@ -911,7 +912,8 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allReduceCpu(
 PGResult<void> MooncakeCommunicator::allReduceGpu(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     ReduceOp op, cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "allReduceGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::AllReduce));
     PG_TRY(auto bytes, getByteCount(count, datatype));
@@ -922,7 +924,7 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supportsReduction(datatype, op)) {
         return nccl_collectives_->allReduce(send_buffer, recv_buffer, count,
-                                            datatype, op, stream);
+                                            datatype, op, stream, status);
     }
     PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
@@ -973,7 +975,8 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allGatherCpu(
 PGResult<void> MooncakeCommunicator::allGatherGpu(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "allGatherGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::AllGather));
     PG_TRY(auto send_bytes, getByteCount(count, datatype));
@@ -984,7 +987,7 @@ PGResult<void> MooncakeCommunicator::allGatherGpu(
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supports(datatype)) {
         return nccl_collectives_->allGather(send_buffer, recv_buffer, count,
-                                            datatype, stream);
+                                            datatype, stream, status);
     }
     const int active_size = getSize();
     worker_->putTaskCuda(
@@ -1042,7 +1045,8 @@ MooncakeCommunicator::reduceScatterCpu(const void* send_buffer,
 PGResult<void> MooncakeCommunicator::reduceScatterGpu(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     ReduceOp op, cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "reduceScatterGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::ReduceScatter));
     PG_TRY(auto recv_bytes, getByteCount(count, datatype));
@@ -1053,7 +1057,7 @@ PGResult<void> MooncakeCommunicator::reduceScatterGpu(
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supportsReduction(datatype, op)) {
         return nccl_collectives_->reduceScatter(send_buffer, recv_buffer, count,
-                                                datatype, op, stream);
+                                                datatype, op, stream, status);
     }
     PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
@@ -1114,7 +1118,8 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allToAllCpu(
 PGResult<void> MooncakeCommunicator::allToAllGpu(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "allToAllGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::AllToAll));
     PG_TRY(auto peer_bytes, getByteCount(count, datatype));
@@ -1125,7 +1130,7 @@ PGResult<void> MooncakeCommunicator::allToAllGpu(
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supports(datatype)) {
         return nccl_collectives_->allToAll(send_buffer, recv_buffer, count,
-                                           datatype, stream);
+                                           datatype, stream, status);
     }
     const int active_size = getSize();
     worker_->putTaskCuda(
@@ -1164,13 +1169,14 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::barrierCpu(
 
 PGResult<void> MooncakeCommunicator::barrierGpu(
     cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "barrierGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::Barrier));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     if (nccl_collectives_ && nccl_collectives_->isActive()) {
-        return nccl_collectives_->barrier(stream);
+        return nccl_collectives_->barrier(stream, status);
     }
     worker_->putTaskCuda(
         OpType::Barrier, kBarrierDummySize, 0, meta_, stream, failed_ranks_hint,
@@ -1209,12 +1215,11 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::reduceCpu(
         });
 }
 
-PGResult<void> MooncakeCommunicator::reduceGpu(const void* send_buffer,
-                                               void* recv_buffer, size_t count,
-                                               DataType datatype, ReduceOp op,
-                                               int root, cudaStream_t stream,
-                                               int32_t* failed_ranks_hint,
-                                               size_t failed_ranks_hint_count) {
+PGResult<void> MooncakeCommunicator::reduceGpu(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    ReduceOp op, int root, cudaStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "reduceGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::Reduce));
     PG_TRY(auto bytes, getByteCount(count, datatype));
@@ -1229,7 +1234,7 @@ PGResult<void> MooncakeCommunicator::reduceGpu(const void* send_buffer,
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supportsReduction(datatype, op)) {
         return nccl_collectives_->reduce(send_buffer, recv_buffer, count,
-                                         datatype, op, root, stream);
+                                         datatype, op, root, stream, status);
     }
     PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
@@ -1282,12 +1287,11 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::gatherCpu(
         });
 }
 
-PGResult<void> MooncakeCommunicator::gatherGpu(const void* send_buffer,
-                                               void* recv_buffer, size_t count,
-                                               DataType datatype, int root,
-                                               cudaStream_t stream,
-                                               int32_t* failed_ranks_hint,
-                                               size_t failed_ranks_hint_count) {
+PGResult<void> MooncakeCommunicator::gatherGpu(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    int root, cudaStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "gatherGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::Gather));
     PG_TRY(auto send_bytes, getByteCount(count, datatype));
@@ -1302,7 +1306,7 @@ PGResult<void> MooncakeCommunicator::gatherGpu(const void* send_buffer,
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supports(datatype)) {
         return nccl_collectives_->gather(send_buffer, recv_buffer, count,
-                                         datatype, root, stream);
+                                         datatype, root, stream, status);
     }
     const int active_size = getSize();
     worker_->putTaskCuda(
@@ -1358,7 +1362,8 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::scatterCpu(
 PGResult<void> MooncakeCommunicator::scatterGpu(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     int root, cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    size_t failed_ranks_hint_count,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
     PG_VALIDATE_STATE(!is_cpu_, "scatterGpu requires a GPU communicator");
     PG_TRY(checkOpState(OpType::Scatter));
     PG_TRY(auto recv_bytes, getByteCount(count, datatype));
@@ -1373,7 +1378,7 @@ PGResult<void> MooncakeCommunicator::scatterGpu(
     if (nccl_collectives_ && nccl_collectives_->isActive() &&
         nccl_collectives_->supports(datatype)) {
         return nccl_collectives_->scatter(send_buffer, recv_buffer, count,
-                                          datatype, root, stream);
+                                          datatype, root, stream, status);
     }
     const int active_size = getSize();
     worker_->putTaskCuda(

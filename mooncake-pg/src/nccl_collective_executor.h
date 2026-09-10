@@ -20,6 +20,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
+#include <vector>
 
 #include "comm_types.h"
 #include "control_plane/control_types.h"
@@ -34,7 +36,7 @@ class NcclCollectiveExecutor {
    public:
     using UniqueId = std::array<uint8_t, kNcclUniqueIdBytes>;
 
-    NcclCollectiveExecutor() = default;
+    NcclCollectiveExecutor();
     ~NcclCollectiveExecutor();
 
     NcclCollectiveExecutor(const NcclCollectiveExecutor&) = delete;
@@ -53,29 +55,38 @@ class NcclCollectiveExecutor {
 
     PGResult<void> broadcast(const void* send_buffer, void* recv_buffer,
                              size_t count, DataType datatype, int root,
-                             cudaStream_t stream);
+                             cudaStream_t stream,
+                             std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> allReduce(const void* send_buffer, void* recv_buffer,
                              size_t count, DataType datatype, ReduceOp op,
-                             cudaStream_t stream);
+                             cudaStream_t stream,
+                             std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> allGather(const void* send_buffer, void* recv_buffer,
                              size_t count, DataType datatype,
-                             cudaStream_t stream);
+                             cudaStream_t stream,
+                             std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> reduceScatter(const void* send_buffer, void* recv_buffer,
                                  size_t count, DataType datatype, ReduceOp op,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream,
+                                 std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> allToAll(const void* send_buffer, void* recv_buffer,
                             size_t count, DataType datatype,
-                            cudaStream_t stream);
+                            cudaStream_t stream,
+                            std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> reduce(const void* send_buffer, void* recv_buffer,
                           size_t count, DataType datatype, ReduceOp op,
-                          int root, cudaStream_t stream);
+                          int root, cudaStream_t stream,
+                          std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> gather(const void* send_buffer, void* recv_buffer,
                           size_t count, DataType datatype, int root,
-                          cudaStream_t stream);
+                          cudaStream_t stream,
+                          std::shared_ptr<GpuCollectiveStatus>* status);
     PGResult<void> scatter(const void* send_buffer, void* recv_buffer,
                            size_t count, DataType datatype, int root,
-                           cudaStream_t stream);
-    PGResult<void> barrier(cudaStream_t stream);
+                           cudaStream_t stream,
+                           std::shared_ptr<GpuCollectiveStatus>* status);
+    PGResult<void> barrier(cudaStream_t stream,
+                           std::shared_ptr<GpuCollectiveStatus>* status);
 
     // NCCL communicators have fixed membership. Abort this communicator before
     // Mooncake applies a different active-rank view; later operations then use
@@ -84,7 +95,15 @@ class NcclCollectiveExecutor {
 
    private:
     template <typename Function>
-    PGResult<void> launch(const char* operation, Function&& function);
+    PGResult<void> launch(const char* operation, cudaStream_t stream,
+                          std::shared_ptr<GpuCollectiveStatus>* status,
+                          Function&& function);
+
+    struct PendingOperation;
+    // Called with mutex_ held. Never query events belonging to captured work.
+    void retireCompletedOperations() noexcept;
+    void markPendingOperationsAborted() noexcept;
+    std::vector<std::unique_ptr<PendingOperation>> pending_operations_;
 
     mutable std::mutex mutex_;
     std::atomic<bool> active_{false};

@@ -14,6 +14,7 @@
 
 #include "nccl_collective_executor.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -99,6 +100,58 @@ auto notCompiled() {
 #endif
 
 }  // namespace
+
+struct NcclCollectiveExecutor::PendingOperation {
+    std::shared_ptr<GpuCollectiveStatus> status =
+        std::make_shared<GpuCollectiveStatus>();
+#ifdef USE_NCCL_PG
+    cudaEvent_t event = nullptr;
+    bool recorded = false;
+    bool captured = false;
+    int device = -1;
+
+    ~PendingOperation() noexcept {
+        if (!event) return;
+        int previous_device = -1;
+        const auto get_result = cudaGetDevice(&previous_device);
+        if (device >= 0) (void)cudaSetDevice(device);
+        const auto result = cudaEventDestroy(event);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "cudaEventDestroy(NCCL operation) failed: "
+                       << cudaGetErrorString(result);
+        }
+        if (get_result == cudaSuccess && previous_device != device) {
+            (void)cudaSetDevice(previous_device);
+        }
+    }
+
+    bool completed() const noexcept {
+        // Captured event records can run repeatedly. Do not latch a successful
+        // replay as completion of every future execution of the same graph.
+        return !captured && recorded && cudaEventQuery(event) == cudaSuccess;
+    }
+#endif
+};
+
+NcclCollectiveExecutor::NcclCollectiveExecutor() = default;
+
+void NcclCollectiveExecutor::retireCompletedOperations() noexcept {
+#ifdef USE_NCCL_PG
+    std::erase_if(pending_operations_, [](const auto& operation) {
+        return operation->status.use_count() == 1 || operation->completed();
+    });
+#endif
+}
+
+void NcclCollectiveExecutor::markPendingOperationsAborted() noexcept {
+#ifdef USE_NCCL_PG
+    for (auto& operation : pending_operations_) {
+        if (!operation->completed()) {
+            operation->status->aborted.store(true, std::memory_order_release);
+        }
+    }
+#endif
+}
 
 NcclCollectiveExecutor::~NcclCollectiveExecutor() {
     disable("executor destruction");
@@ -232,42 +285,89 @@ bool NcclCollectiveExecutor::supportsReduction(DataType datatype,
 }
 
 template <typename Function>
-PGResult<void> NcclCollectiveExecutor::launch(const char* operation,
-                                              Function&& function) {
+PGResult<void> NcclCollectiveExecutor::launch(
+    const char* operation, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status, Function&& function) {
 #ifdef USE_NCCL_PG
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(active_.load(std::memory_order_acquire) && communicator_,
                       "NCCL collective executor is inactive");
+    const GpuDeviceGuard device_guard(device_index_);
+    PendingOperation* tracked = nullptr;
+    if (status) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        auto result = cudaStreamIsCapturing(stream, &capture_status);
+        if (result != cudaSuccess) {
+            return makePGError(PGErrorCode::SystemError,
+                               cudaGetErrorString(result));
+        }
+        // Do not query prior CUDA events from a capturing thread.
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            retireCompletedOperations();
+        }
+        auto pending = std::make_unique<PendingOperation>();
+        pending->device = device_index_;
+        pending->captured = capture_status != cudaStreamCaptureStatusNone;
+        if (!pending->captured) {
+            result = cudaEventCreateWithFlags(&pending->event,
+                                              cudaEventDisableTiming);
+            if (result != cudaSuccess) {
+                return makePGError(PGErrorCode::SystemError,
+                                   cudaGetErrorString(result));
+            }
+        }
+        tracked = pending.get();
+        // Allocate and register before launching so exceptions cannot leave a
+        // submitted operation outside abort tracking.
+        pending_operations_.push_back(std::move(pending));
+        *status = tracked->status;
+    }
     auto comm = static_cast<ncclComm_t>(communicator_);
     const auto result = static_cast<ncclResult_t>(function(communicator_));
     if (result != ncclSuccess) {
+        // Invalidate pending work before abort lets its CUDA events complete.
+        markPendingOperationsAborted();
         // Keep routing this group to the failed NCCL executor. Falling back to
         // TE on only one rank would mismatch the other ranks and can hang. A
         // coordinated membership view change calls disable() and is the only
         // transition that permits TE fallback.
         communicator_ = nullptr;
         (void)ncclCommAbort(comm);
+        pending_operations_.clear();
         return makePGError(makeNcclError(operation, result));
+    }
+    if (tracked && !tracked->captured) {
+        const auto event_result = cudaEventRecord(tracked->event, stream);
+        if (event_result != cudaSuccess) {
+            markPendingOperationsAborted();
+            communicator_ = nullptr;
+            (void)ncclCommAbort(comm);
+            pending_operations_.clear();
+            return makePGError(PGErrorCode::SystemError,
+                               cudaGetErrorString(event_result));
+        }
+        tracked->recorded = true;
     }
     return {};
 #else
     (void)operation;
+    (void)stream;
+    (void)status;
     (void)function;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::broadcast(const void* send_buffer,
-                                                 void* recv_buffer,
-                                                 size_t count,
-                                                 DataType datatype, int root,
-                                                 cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::broadcast(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    int root, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     PG_VALIDATE_ARG(root >= 0 && root < size_,
                     "root is outside the NCCL communicator");
     const auto type = toNcclDataType(datatype);
     PG_VALIDATE_ARG(type.has_value(), "datatype is unsupported by NCCL");
-    return launch("ncclBroadcast", [=](void* opaque) {
+    return launch("ncclBroadcast", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclBroadcast(send_buffer, recv_buffer, count, *type, root,
                           static_cast<ncclComm_t>(opaque), stream));
@@ -279,21 +379,21 @@ PGResult<void> NcclCollectiveExecutor::broadcast(const void* send_buffer,
     (void)datatype;
     (void)root;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::allReduce(const void* send_buffer,
-                                                 void* recv_buffer,
-                                                 size_t count,
-                                                 DataType datatype, ReduceOp op,
-                                                 cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::allReduce(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    ReduceOp op, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     const auto type = toNcclDataType(datatype);
     const auto reduction = toNcclReduceOp(op);
     PG_VALIDATE_ARG(type.has_value() && reduction.has_value(),
                     "reduction is unsupported by NCCL");
-    return launch("ncclAllReduce", [=](void* opaque) {
+    return launch("ncclAllReduce", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclAllReduce(send_buffer, recv_buffer, count, *type, *reduction,
                           static_cast<ncclComm_t>(opaque), stream));
@@ -305,19 +405,18 @@ PGResult<void> NcclCollectiveExecutor::allReduce(const void* send_buffer,
     (void)datatype;
     (void)op;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::allGather(const void* send_buffer,
-                                                 void* recv_buffer,
-                                                 size_t count,
-                                                 DataType datatype,
-                                                 cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::allGather(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    cudaStream_t stream, std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     const auto type = toNcclDataType(datatype);
     PG_VALIDATE_ARG(type.has_value(), "datatype is unsupported by NCCL");
-    return launch("ncclAllGather", [=](void* opaque) {
+    return launch("ncclAllGather", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclAllGather(send_buffer, recv_buffer, count, *type,
                           static_cast<ncclComm_t>(opaque), stream));
@@ -328,19 +427,21 @@ PGResult<void> NcclCollectiveExecutor::allGather(const void* send_buffer,
     (void)count;
     (void)datatype;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
 PGResult<void> NcclCollectiveExecutor::reduceScatter(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
-    ReduceOp op, cudaStream_t stream) {
+    ReduceOp op, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     const auto type = toNcclDataType(datatype);
     const auto reduction = toNcclReduceOp(op);
     PG_VALIDATE_ARG(type.has_value() && reduction.has_value(),
                     "reduction is unsupported by NCCL");
-    return launch("ncclReduceScatter", [=](void* opaque) {
+    return launch("ncclReduceScatter", stream, status, [=](void* opaque) {
         return static_cast<int>(ncclReduceScatter(
             send_buffer, recv_buffer, count, *type, *reduction,
             static_cast<ncclComm_t>(opaque), stream));
@@ -352,14 +453,14 @@ PGResult<void> NcclCollectiveExecutor::reduceScatter(
     (void)datatype;
     (void)op;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::allToAll(const void* send_buffer,
-                                                void* recv_buffer, size_t count,
-                                                DataType datatype,
-                                                cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::allToAll(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    cudaStream_t stream, std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     const auto type = toNcclDataType(datatype);
     PG_VALIDATE_ARG(type.has_value(), "datatype is unsupported by NCCL");
@@ -391,7 +492,7 @@ PGResult<void> NcclCollectiveExecutor::allToAll(const void* send_buffer,
         nccl_send_buffer = staging;
     }
 
-    auto result = launch("ncclAlltoAll", [=](void* opaque) {
+    auto result = launch("ncclAlltoAll", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclAlltoAll(nccl_send_buffer, recv_buffer, count, *type,
                          static_cast<ncclComm_t>(opaque), stream));
@@ -412,14 +513,15 @@ PGResult<void> NcclCollectiveExecutor::allToAll(const void* send_buffer,
     (void)count;
     (void)datatype;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::reduce(const void* send_buffer,
-                                              void* recv_buffer, size_t count,
-                                              DataType datatype, ReduceOp op,
-                                              int root, cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::reduce(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    ReduceOp op, int root, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     PG_VALIDATE_ARG(root >= 0 && root < size_,
                     "root is outside the NCCL communicator");
@@ -427,7 +529,7 @@ PGResult<void> NcclCollectiveExecutor::reduce(const void* send_buffer,
     const auto reduction = toNcclReduceOp(op);
     PG_VALIDATE_ARG(type.has_value() && reduction.has_value(),
                     "reduction is unsupported by NCCL");
-    return launch("ncclReduce", [=](void* opaque) {
+    return launch("ncclReduce", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclReduce(send_buffer, recv_buffer, count, *type, *reduction, root,
                        static_cast<ncclComm_t>(opaque), stream));
@@ -440,20 +542,21 @@ PGResult<void> NcclCollectiveExecutor::reduce(const void* send_buffer,
     (void)op;
     (void)root;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::gather(const void* send_buffer,
-                                              void* recv_buffer, size_t count,
-                                              DataType datatype, int root,
-                                              cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::gather(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    int root, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     PG_VALIDATE_ARG(root >= 0 && root < size_,
                     "root is outside the NCCL communicator");
     const auto type = toNcclDataType(datatype);
     PG_VALIDATE_ARG(type.has_value(), "datatype is unsupported by NCCL");
-    return launch("ncclGather", [=](void* opaque) {
+    return launch("ncclGather", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclGather(send_buffer, recv_buffer, count, *type, root,
                        static_cast<ncclComm_t>(opaque), stream));
@@ -465,20 +568,21 @@ PGResult<void> NcclCollectiveExecutor::gather(const void* send_buffer,
     (void)datatype;
     (void)root;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::scatter(const void* send_buffer,
-                                               void* recv_buffer, size_t count,
-                                               DataType datatype, int root,
-                                               cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::scatter(
+    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
+    int root, cudaStream_t stream,
+    std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
     PG_VALIDATE_ARG(root >= 0 && root < size_,
                     "root is outside the NCCL communicator");
     const auto type = toNcclDataType(datatype);
     PG_VALIDATE_ARG(type.has_value(), "datatype is unsupported by NCCL");
-    return launch("ncclScatter", [=](void* opaque) {
+    return launch("ncclScatter", stream, status, [=](void* opaque) {
         return static_cast<int>(
             ncclScatter(send_buffer, recv_buffer, count, *type, root,
                         static_cast<ncclComm_t>(opaque), stream));
@@ -490,19 +594,22 @@ PGResult<void> NcclCollectiveExecutor::scatter(const void* send_buffer,
     (void)datatype;
     (void)root;
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::barrier(cudaStream_t stream) {
+PGResult<void> NcclCollectiveExecutor::barrier(
+    cudaStream_t stream, std::shared_ptr<GpuCollectiveStatus>* status) {
 #ifdef USE_NCCL_PG
-    return launch("NCCL barrier", [=, this](void* opaque) {
+    return launch("NCCL barrier", stream, status, [=, this](void* opaque) {
         return static_cast<int>(
             ncclAllReduce(barrier_buffer_, barrier_buffer_, 1, ncclInt32,
                           ncclSum, static_cast<ncclComm_t>(opaque), stream));
     });
 #else
     (void)stream;
+    (void)status;
     return notCompiled();
 #endif
 }
@@ -511,6 +618,9 @@ void NcclCollectiveExecutor::disable(const char* reason) noexcept {
 #ifdef USE_NCCL_PG
     std::lock_guard<std::mutex> lock(mutex_);
     if (communicator_) {
+        // Snapshot completion before abort. Once abort releases GPU work, its
+        // events alone cannot distinguish success from cancellation.
+        markPendingOperationsAborted();
         auto comm = static_cast<ncclComm_t>(communicator_);
         communicator_ = nullptr;
         const auto result = ncclCommAbort(comm);
@@ -521,6 +631,7 @@ void NcclCollectiveExecutor::disable(const char* reason) noexcept {
         LOG(INFO) << "Mooncake PG disabled NCCL collectives: "
                   << (reason ? reason : "unspecified reason");
     }
+    pending_operations_.clear();
     // Publish TE eligibility only after abort completes while holding the same
     // lock used by launch(). This prevents a concurrent operation from routing
     // to TE while another rank can still enqueue on the old NCCL communicator.

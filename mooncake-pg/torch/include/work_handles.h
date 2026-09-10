@@ -18,6 +18,11 @@
 
 namespace mooncake {
 
+using GpuCollectiveStatusHandle =
+    std::shared_ptr<::mooncakePgGpuCollectiveStatus>;
+GpuCollectiveStatusHandle ownGpuCollectiveStatus(
+    mooncakePgGpuCollectiveStatus_t status);
+
 // Per-operation failedRanksHint buffer
 struct FailedRanksHint {
     at::Tensor tensor;
@@ -105,7 +110,8 @@ class MooncakeWorkCuda : public ::c10d::Work {
                      FailedRanksHint failedRanksHint,
                      std::shared_ptr<MooncakeWorkTracker> tracker,
                      std::vector<at::Tensor> keepAlive = {},
-                     bool is_captured = false);
+                     bool is_captured = false,
+                     GpuCollectiveStatusHandle gpu_status = {});
     ~MooncakeWorkCuda() override;
 
     bool isCompleted() override { return event_->query(); }
@@ -119,6 +125,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
    private:
     bool is_captured_ = false;
+    GpuCollectiveStatusHandle gpu_status_;
     FailedRanksHint failed_ranks_hint_;
     std::shared_ptr<MooncakeWorkTracker> tracker_;
     std::vector<at::Tensor> keep_alive_;

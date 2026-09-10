@@ -308,6 +308,19 @@ caller-visible results are:
 Failure hints can differ across ranks. Workers submit such observations to the
 Coordinator instead of changing membership locally.
 
+With the optional NCCL collective backend, an aborted operation reports
+`local_success=false` even if its CUDA completion event has finished. Its
+`failed_ranks_hint` can remain all zeros because abort does not identify a
+failed peer. Use `get_local_success(work)` rather than deriving success from
+the bitmap. Completed eager operations retain their outcome after communicator
+shutdown; captured NCCL work remains abort-sensitive because its graph can
+replay. Synchronize graph execution directly: host-side status queries on
+captured Work are not supported. A graph must not be replayed after its NCCL
+communicator is aborted. Release captured graphs before destroying the process
+group, since NCCL teardown waits for those graph references.
+This abort tracking does not yet add asynchronous NCCL error monitoring or
+the TE backend's automatic failure-reconciliation completion guarantee.
+
 #### Reconciliation and `sync_after_failure`
 
 Negative evidence opens a reconciliation window in the Coordinator, allowing
