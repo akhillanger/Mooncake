@@ -15,6 +15,8 @@
 #include "nccl_collective_executor.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -109,6 +111,8 @@ struct NcclCollectiveExecutor::PendingOperation {
     bool recorded = false;
     bool captured = false;
     int device = -1;
+    std::chrono::steady_clock::time_point started =
+        std::chrono::steady_clock::now();
 
     ~PendingOperation() noexcept {
         if (!event) return;
@@ -138,23 +142,36 @@ NcclCollectiveExecutor::NcclCollectiveExecutor() = default;
 void NcclCollectiveExecutor::retireCompletedOperations() noexcept {
 #ifdef USE_NCCL_PG
     std::erase_if(pending_operations_, [](const auto& operation) {
-        return operation->status.use_count() == 1 || operation->completed();
+        // Eager operations still need a deadline even if the caller discarded
+        // their status. Captured records have no per-replay completion event.
+        return operation->completed() ||
+               (operation->captured && operation->recorded &&
+                operation->status.use_count() == 1);
     });
 #endif
 }
 
-void NcclCollectiveExecutor::markPendingOperationsAborted() noexcept {
+uint64_t NcclCollectiveExecutor::markPendingOperationsAborted() noexcept {
+    uint64_t first_failed_operation = next_operation_;
 #ifdef USE_NCCL_PG
     for (auto& operation : pending_operations_) {
         if (!operation->completed()) {
             operation->status->aborted.store(true, std::memory_order_release);
+            // Graph replay is not a new host submission. Its Work remains
+            // abort-sensitive, but capture order is not a replay sequence.
+            if (!operation->captured) {
+                first_failed_operation = std::min(first_failed_operation,
+                                                  operation->status->sequence);
+            }
         }
     }
 #endif
+    return first_failed_operation;
 }
 
 NcclCollectiveExecutor::~NcclCollectiveExecutor() {
     disable("executor destruction");
+    if (watchdog_.joinable()) watchdog_.join();
 #ifdef USE_NCCL_PG
     void* barrier_buffer = nullptr;
     int device_index = -1;
@@ -206,30 +223,48 @@ NcclCollectiveExecutor::createUniqueId() {
 #endif
 }
 
-PGResult<void> NcclCollectiveExecutor::initialize(const UniqueId& unique_id,
-                                                  int rank, int size,
-                                                  int device_index) {
+PGResult<void> NcclCollectiveExecutor::initialize(
+    const UniqueId& unique_id, int rank, int size, int device_index,
+    const std::atomic<size_t>* timeout_us) {
 #ifdef USE_NCCL_PG
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(!communicator_, "NCCL executor is already initialized");
+    PG_VALIDATE_STATE(!communicator_ && !watchdog_.joinable(),
+                      "NCCL executor is already initialized");
     PG_VALIDATE_ARG(rank >= 0 && rank < size, "invalid NCCL rank");
     PG_VALIDATE_ARG(size > 1, "NCCL communicator requires at least two ranks");
+    PG_VALIDATE_ARG(timeout_us, "NCCL collective timeout is null");
+    // NCCL's environment setting overrides config.blocking. Blocking calls
+    // would prevent serialized timeout/abort handling from making progress.
+    const char* blocking = std::getenv("NCCL_COMM_BLOCKING");
+    PG_VALIDATE_ARG(!blocking || std::strcmp(blocking, "0") == 0,
+                    "Mooncake PG requires NCCL_COMM_BLOCKING unset or 0");
 
     GpuDeviceGuard device_guard(device_index);
     ncclUniqueId id{};
     static_assert(sizeof(id.internal) == kNcclUniqueIdBytes);
     std::memcpy(id.internal, unique_id.data(), unique_id.size());
 
-    // A blocking communicator makes every host API return only after its GPU
-    // work has been enqueued. Mooncake can then record its completion event
-    // immediately without polling ncclCommGetAsyncError on every collective.
+    // Nonblocking NCCL calls let us serialize abort against API calls without
+    // getting stuck inside a host-side connection/setup operation.
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-    config.blocking = 1;
+    config.blocking = 0;
     ncclComm_t candidate = nullptr;
-    const auto result =
-        ncclCommInitRankConfig(&candidate, size, id, rank, &config);
+    auto result = ncclCommInitRankConfig(&candidate, size, id, rank, &config);
+    const auto init_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(300);
+    while (result == ncclInProgress &&
+           std::chrono::steady_clock::now() < init_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ncclResult_t state = ncclInProgress;
+        result = ncclCommGetAsyncError(candidate, &state);
+        if (result == ncclSuccess) result = state;
+    }
     if (result != ncclSuccess) {
         if (candidate) (void)ncclCommAbort(candidate);
+        if (result == ncclInProgress) {
+            return makePGError(PGErrorCode::Timeout,
+                               "NCCL initialization timed out");
+        }
         return makePGError(makeNcclError("ncclCommInitRankConfig", result));
     }
 
@@ -250,7 +285,11 @@ PGResult<void> NcclCollectiveExecutor::initialize(const UniqueId& unique_id,
     barrier_buffer_ = barrier_buffer;
     device_index_ = device_index;
     size_ = size;
+    timeout_us_ = timeout_us;
+    unique_id_ = unique_id;
+    generation_ready_.store(true, std::memory_order_release);
     active_.store(true, std::memory_order_release);
+    watchdog_ = std::thread(&NcclCollectiveExecutor::watchdogLoop, this);
     LOG(INFO) << "Mooncake PG initialized NCCL collectives for rank " << rank
               << "/" << size << " on CUDA device " << device_index;
     return {};
@@ -259,8 +298,33 @@ PGResult<void> NcclCollectiveExecutor::initialize(const UniqueId& unique_id,
     (void)rank;
     (void)size;
     (void)device_index;
+    (void)timeout_us;
     return notCompiled();
 #endif
+}
+
+std::optional<NcclCollectiveFailure> NcclCollectiveExecutor::failedGeneration()
+    const noexcept {
+    if (isActive() && failed_.load(std::memory_order_acquire)) {
+        return NcclCollectiveFailure{
+            .unique_id = unique_id_,
+            .first_failed_operation =
+                failure_state_->first_failed_operation.load(
+                    std::memory_order_acquire)};
+    }
+    return std::nullopt;
+}
+
+void NcclCollectiveExecutor::requestGroupAbort(
+    const NcclCollectiveFailure& failure) noexcept {
+    if (!generation_ready_.load(std::memory_order_acquire) ||
+        failure.unique_id != unique_id_)
+        return;
+    // Update retained Work even if this executor has already been disabled by
+    // a membership change. It still belongs to this same old generation.
+    failure_state_->failFrom(failure.first_failed_operation);
+    group_abort_requested_.store(true, std::memory_order_release);
+    progress_.notify_all();
 }
 
 bool NcclCollectiveExecutor::supports(DataType datatype) const noexcept {
@@ -270,6 +334,27 @@ bool NcclCollectiveExecutor::supports(DataType datatype) const noexcept {
     (void)datatype;
     return false;
 #endif
+}
+
+PGResult<NcclCollectiveFailure> NcclCollectiveExecutor::quiesceForRecovery() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        PG_VALIDATE_STATE(
+            isActive() &&
+                (failed_.load(std::memory_order_acquire) ||
+                 group_abort_requested_.load(std::memory_order_acquire)),
+            "NCCL recovery requires an observed communicator failure");
+        abortLocked("NCCL communicator failure reported by the coordinator");
+        PG_VALIDATE_STATE(abort_succeeded_,
+                          "NCCL abort did not complete successfully");
+    }
+    // Do not wait for launch_mutex_ before abort: an ncclInProgress submission
+    // holds it while waiting for the watchdog/abort to unblock it.
+    std::lock_guard<std::mutex> submission(launch_mutex_);
+    const auto failure = failedGeneration();
+    PG_VALIDATE_STATE(failure.has_value(),
+                      "NCCL backend changed during recovery");
+    return *failure;
 }
 
 bool NcclCollectiveExecutor::supportsReduction(DataType datatype,
@@ -289,65 +374,69 @@ PGResult<void> NcclCollectiveExecutor::launch(
     const char* operation, cudaStream_t stream,
     std::shared_ptr<GpuCollectiveStatus>* status, Function&& function) {
 #ifdef USE_NCCL_PG
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> submission(launch_mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (group_abort_requested_.load(std::memory_order_acquire)) {
+        abortLocked("NCCL communicator failure reported by the coordinator");
+    }
+    if (failure_reason_) return makePGError(failure_code_, failure_reason_);
     PG_VALIDATE_STATE(active_.load(std::memory_order_acquire) && communicator_,
                       "NCCL collective executor is inactive");
     const GpuDeviceGuard device_guard(device_index_);
-    PendingOperation* tracked = nullptr;
-    if (status) {
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        auto result = cudaStreamIsCapturing(stream, &capture_status);
-        if (result != cudaSuccess) {
-            return makePGError(PGErrorCode::SystemError,
-                               cudaGetErrorString(result));
-        }
-        // Do not query prior CUDA events from a capturing thread.
-        if (capture_status == cudaStreamCaptureStatusNone) {
-            retireCompletedOperations();
-        }
-        auto pending = std::make_unique<PendingOperation>();
-        pending->device = device_index_;
-        pending->captured = capture_status != cudaStreamCaptureStatusNone;
-        if (!pending->captured) {
-            result = cudaEventCreateWithFlags(&pending->event,
-                                              cudaEventDisableTiming);
-            if (result != cudaSuccess) {
-                return makePGError(PGErrorCode::SystemError,
-                                   cudaGetErrorString(result));
-            }
-        }
-        tracked = pending.get();
-        // Allocate and register before launching so exceptions cannot leave a
-        // submitted operation outside abort tracking.
-        pending_operations_.push_back(std::move(pending));
-        *status = tracked->status;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    auto cuda_result = cudaStreamIsCapturing(stream, &capture_status);
+    if (cuda_result != cudaSuccess) {
+        return makePGError(PGErrorCode::SystemError,
+                           cudaGetErrorString(cuda_result));
     }
-    auto comm = static_cast<ncclComm_t>(communicator_);
-    const auto result = static_cast<ncclResult_t>(function(communicator_));
+    if (capture_status == cudaStreamCaptureStatusNone) {
+        retireCompletedOperations();
+    }
+    auto pending = std::make_unique<PendingOperation>();
+    pending->device = device_index_;
+    pending->captured = capture_status != cudaStreamCaptureStatusNone;
+    if (!pending->captured) {
+        cuda_result =
+            cudaEventCreateWithFlags(&pending->event, cudaEventDisableTiming);
+        if (cuda_result != cudaSuccess) {
+            return makePGError(PGErrorCode::SystemError,
+                               cudaGetErrorString(cuda_result));
+        }
+    }
+    auto* tracked = pending.get();
+    tracked->status->failure_state = failure_state_;
+    tracked->status->sequence = next_operation_++;
+    // Track even legacy C API calls without a returned status: discarding a
+    // handle must not remove the deadline for an outstanding GPU operation.
+    pending_operations_.push_back(std::move(pending));
+    if (status) *status = tracked->status;
+    progress_.notify_all();
+    auto result = static_cast<ncclResult_t>(function(communicator_));
+    while (result == ncclInProgress) {
+        // No CUDA event may be recorded until NCCL finishes enqueueing. Drop
+        // mutex_ while waiting so the watchdog or a view update can abort.
+        progress_.wait_for(lock, std::chrono::microseconds(100));
+        if (!communicator_) {
+            return makePGError(failure_code_, failure_reason_);
+        }
+        ncclResult_t state = ncclInProgress;
+        result = ncclCommGetAsyncError(static_cast<ncclComm_t>(communicator_),
+                                       &state);
+        if (result == ncclSuccess) result = state;
+    }
     if (result != ncclSuccess) {
-        // Invalidate pending work before abort lets its CUDA events complete.
-        markPendingOperationsAborted();
-        // Keep routing this group to the failed NCCL executor. Falling back to
-        // TE on only one rank would mismatch the other ranks and can hang. A
-        // coordinated membership view change calls disable() and is the only
-        // transition that permits TE fallback.
-        communicator_ = nullptr;
-        (void)ncclCommAbort(comm);
-        pending_operations_.clear();
+        abortLocked("NCCL enqueue failed");
         return makePGError(makeNcclError(operation, result));
     }
-    if (tracked && !tracked->captured) {
+    if (!tracked->captured) {
         const auto event_result = cudaEventRecord(tracked->event, stream);
         if (event_result != cudaSuccess) {
-            markPendingOperationsAborted();
-            communicator_ = nullptr;
-            (void)ncclCommAbort(comm);
-            pending_operations_.clear();
+            abortLocked("NCCL completion event recording failed");
             return makePGError(PGErrorCode::SystemError,
                                cudaGetErrorString(event_result));
         }
-        tracked->recorded = true;
     }
+    tracked->recorded = true;
     return {};
 #else
     (void)operation;
@@ -614,31 +703,120 @@ PGResult<void> NcclCollectiveExecutor::barrier(
 #endif
 }
 
-void NcclCollectiveExecutor::disable(const char* reason) noexcept {
+void NcclCollectiveExecutor::abortLocked(const char* reason, PGErrorCode code,
+                                         bool report_failure) noexcept {
 #ifdef USE_NCCL_PG
-    std::lock_guard<std::mutex> lock(mutex_);
     if (communicator_) {
+        failure_reason_ = reason;
+        failure_code_ = code;
         // Snapshot completion before abort. Once abort releases GPU work, its
         // events alone cannot distinguish success from cancellation.
-        markPendingOperationsAborted();
+        const auto first_failed_operation = markPendingOperationsAborted();
+        // Publish before teardown, which may wait on captured graph references.
+        // Shutdown and membership-driven disable are not failure observations.
+        if (report_failure) {
+            failure_state_->failFrom(first_failed_operation);
+            failed_.store(true, std::memory_order_release);
+        }
         auto comm = static_cast<ncclComm_t>(communicator_);
         communicator_ = nullptr;
         const auto result = ncclCommAbort(comm);
+        abort_succeeded_ = result == ncclSuccess;
         if (result != ncclSuccess) {
             LOG(ERROR) << "ncclCommAbort failed: "
                        << ncclGetErrorString(result);
         }
-        LOG(INFO) << "Mooncake PG disabled NCCL collectives: "
-                  << (reason ? reason : "unspecified reason");
+        LOG(INFO) << "Mooncake PG aborted NCCL collectives: " << reason;
     }
     pending_operations_.clear();
-    // Publish TE eligibility only after abort completes while holding the same
-    // lock used by launch(). This prevents a concurrent operation from routing
-    // to TE while another rank can still enqueue on the old NCCL communicator.
-    active_.store(false, std::memory_order_release);
+    progress_.notify_all();
+    // Do not publish TE eligibility after a local timeout/error. Only a
+    // coordinated view change or recovery commit may enable TE via disable().
 #else
     (void)reason;
+    (void)code;
+    (void)report_failure;
 #endif
+}
+
+void NcclCollectiveExecutor::watchdogLoop() noexcept {
+#ifdef USE_NCCL_PG
+    try {
+        const GpuDeviceGuard device_guard(device_index_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (communicator_) {
+            progress_.wait_for(lock, std::chrono::milliseconds(1));
+            if (!communicator_) break;
+            if (group_abort_requested_.load(std::memory_order_acquire)) {
+                abortLocked(
+                    "NCCL communicator failure reported by the coordinator");
+                break;
+            }
+            ncclResult_t state = ncclSuccess;
+            const auto result = ncclCommGetAsyncError(
+                static_cast<ncclComm_t>(communicator_), &state);
+            if (result != ncclSuccess ||
+                (state != ncclSuccess && state != ncclInProgress)) {
+                LOG(ERROR) << "NCCL asynchronous error: "
+                           << ncclGetErrorString(result != ncclSuccess ? result
+                                                                       : state);
+                abortLocked("NCCL asynchronous error");
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const size_t timeout_us =
+                timeout_us_->load(std::memory_order_relaxed);
+            const char* failure = nullptr;
+            PGErrorCode code = PGErrorCode::SystemError;
+            for (const auto& operation : pending_operations_) {
+                // Capture is not execution. Only host enqueue is timed for
+                // captured work; per-replay deadlines require graph
+                // integration.
+                if (operation->captured && operation->recorded) continue;
+                if (operation->recorded) {
+                    const auto event_result = cudaEventQuery(operation->event);
+                    if (event_result == cudaSuccess) continue;
+                    if (event_result != cudaErrorNotReady) {
+                        failure = "NCCL completion event query failed";
+                        break;
+                    }
+                }
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - operation->started)
+                        .count();
+                if (static_cast<uint64_t>(elapsed) > timeout_us) {
+                    failure = "NCCL collective timed out";
+                    code = PGErrorCode::Timeout;
+                    break;
+                }
+            }
+            if (failure) {
+                abortLocked(failure, code);
+                break;
+            }
+            retireCompletedOperations();
+        }
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "NCCL watchdog failed: " << error.what();
+        std::lock_guard<std::mutex> lock(mutex_);
+        abortLocked("NCCL watchdog failed");
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        abortLocked("NCCL watchdog failed");
+    }
+#endif
+}
+
+void NcclCollectiveExecutor::disable(const char* reason) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    abortLocked(reason ? reason : "NCCL executor disabled",
+                PGErrorCode::SystemError, /*report_failure=*/false);
+    // Publish TE eligibility only after abort completes while holding the same
+    // lock used by launch(). This prevents a concurrent local operation from
+    // routing to TE before this rank has aborted its old NCCL communicator.
+    active_.store(false, std::memory_order_release);
 }
 
 }  // namespace mooncake

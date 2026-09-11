@@ -69,7 +69,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     explicit CentralizedCoordinatorStateMachine(
         int max_world_size,
         std::chrono::microseconds fault_reconciliation_window =
-            std::chrono::microseconds(50000));
+            std::chrono::microseconds(50000),
+        std::chrono::milliseconds nccl_recovery_timeout = kNcclRecoveryTimeout);
 
     void setFaultReconciliationWindow(
         std::chrono::microseconds fault_reconciliation_window);
@@ -147,6 +148,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::vector<RankInfo> ranks_;
 
     std::unordered_map<GroupId, GroupView> group_views_;
+    // One latched failure per runtime group; removed with the group. NCCL is
+    // currently initialized only once per group, before any membership change.
+    std::unordered_map<GroupId, NcclCollectiveFailure> nccl_failures_;
 
     // A bootstrap id may name multiple runtime groups. The resolve policy
     // distinguishes creation from attach/append resolution within the bucket.
@@ -193,6 +197,25 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         uint64_t agent_session_id = 0;
         std::optional<LinkEventReportAck> link_event_report_ack;
     };
+
+    struct NcclRecoveryState {
+        NcclRecoveryRequest request;
+        std::unordered_map<GlobalRank, uint64_t> sessions;
+        std::unordered_set<GlobalRank> arrived;
+        std::vector<PendingSync> pending;
+        std::chrono::steady_clock::time_point deadline;
+        // Retain the decision so a lost reply can be retried safely.
+        bool committed = false;
+    };
+    std::unordered_map<GroupId, NcclRecoveryState> nccl_recoveries_;
+    std::chrono::milliseconds nccl_recovery_timeout_;
+    bool recordNcclFailure(GlobalRank rank,
+                           const NcclCollectiveFailure& failure);
+    void handleNcclRecovery(uint64_t sync_id,
+                            const SyncAfterFailureRequest& req,
+                            std::optional<LinkEventReportAck> link_ack,
+                            std::vector<CoordinatorEffect>& effects);
+    void progressNcclRecoveries(std::vector<CoordinatorEffect>& effects);
 
     using PendingSyncs = std::unordered_map<
         GroupId, std::unordered_map<GlobalRank, std::vector<PendingSync>>>;

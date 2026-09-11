@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <limits>
+#include <memory>
 #include <utility>
 
 #include "error_types.h"
@@ -93,10 +95,35 @@ enum class GpuCollectiveBackend : uint8_t {
     Nccl = 2,
 };
 
+// Shared by the Work objects of one NCCL communicator. A peer's abort can
+// release CUDA work before its failure notification arrives, so local event
+// completion cannot by itself preserve success for the affected collective.
+struct GpuCollectiveFailureState {
+    std::atomic<uint64_t> first_failed_operation{
+        std::numeric_limits<uint64_t>::max()};
+
+    void failFrom(uint64_t sequence) noexcept {
+        auto current = first_failed_operation.load(std::memory_order_acquire);
+        while (sequence < current &&
+               !first_failed_operation.compare_exchange_weak(
+                   current, sequence, std::memory_order_acq_rel)) {
+        }
+    }
+};
+
 // Independent of peer-failure hints: a collective may be aborted without
 // identifying a failed peer. Shared with Work objects after executor teardown.
 struct GpuCollectiveStatus {
     std::atomic<bool> aborted{false};
+    std::shared_ptr<GpuCollectiveFailureState> failure_state;
+    uint64_t sequence = 0;
+
+    bool isAborted() const noexcept {
+        return aborted.load(std::memory_order_acquire) ||
+               (failure_state &&
+                sequence >= failure_state->first_failed_operation.load(
+                                std::memory_order_acquire));
+    }
 };
 
 class WorkCompletion {

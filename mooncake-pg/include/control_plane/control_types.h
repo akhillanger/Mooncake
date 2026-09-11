@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -28,6 +29,21 @@ using GroupId = std::string;
 constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
 constexpr std::size_t kNcclUniqueIdBytes = 128;
+
+// Failure of one NCCL communicator, not evidence against a particular peer.
+// The runtime group id and bootstrap token fence delayed notifications from
+// other groups or a replacement NCCL communicator. View epochs are unsuitable:
+// endpoint/health updates may advance them without creating a new communicator.
+struct NcclCollectiveFailure {
+    GroupId group_id;
+    std::array<uint8_t, kNcclUniqueIdBytes> unique_id{};
+    // NCCL host submissions have the same order on every member. Preserve
+    // earlier successful work, but fail this operation and any later work even
+    // if peer abort has already released their local CUDA events.
+    uint64_t first_failed_operation = std::numeric_limits<uint64_t>::max();
+
+    bool operator==(const NcclCollectiveFailure&) const = default;
+};
 
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.

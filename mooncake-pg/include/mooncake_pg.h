@@ -246,12 +246,15 @@ mooncakePgBarrierGpu(mooncakePgComm_t comm, mooncakePgStream_t stream,
                      int32_t* failedRanksHint, size_t failedRanksHintCount);
 
 /*
- * Opt-in abort tracking for GPU collectives. Existing entry points above keep
+ * Opt-in abort-status handles for GPU collectives. Existing entry points keep
  * their signatures; these variants additionally return an owned status handle
  * when the operation uses NCCL, or NULL for the TE path. An aborted NCCL
  * operation may have an all-zero failedRanksHint: no peer is blamed without
  * evidence. Use both the status handle and failedRanksHint after stream
- * completion. This is not an asynchronous-error monitor or a completion wait.
+ * completion. Querying this handle does not wait for completion.
+ * A delayed peer-failure notification can still mark the affected operation
+ * aborted after its local CUDA event finishes; local completion is not a
+ * group-wide success acknowledgement. Earlier successful work is preserved.
  * Captured NCCL work remains abort-sensitive for the communicator's lifetime,
  * since a graph can replay. This does not make replay after abort safe.
  */
@@ -384,6 +387,19 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommDeactivateRanks(
     mooncakePgComm_t comm, const int32_t* ranks, size_t rankCount,
     mooncakePgProposalResponse_t* response);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommJoin(mooncakePgComm_t comm);
+/**
+ * Reconcile TE failures, or explicitly recover an observed NCCL failure to TE.
+ * NCCL recovery requires every active rank (including idle ranks) to call this
+ * API at the same application retry boundary, after stopping new submissions,
+ * finishing prior TE work, and releasing captured graphs. Serialize this call
+ * with group operations and membership changes. It does not replay failed work.
+ * Reconciled authorizes TE fallback only after all ranks acknowledge the same
+ * failed generation/view and TE task sequence. A missing rank causes rejection
+ * after a 20-second coordinator deadline; rejection/RPC errors do not authorize
+ * local fallback. All ranks may retry. NoPending before the local NCCL failure
+ * notification arrives does not imply recovery: check the active backend.
+ * Worker-driven TE reconciliation retains its existing behavior.
+ */
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommSyncAfterFailure(
     mooncakePgComm_t comm, mooncakePgSyncAfterFailureResponse_t* response);
 MOONCAKE_PG_EXPORT mooncakePgResult_t

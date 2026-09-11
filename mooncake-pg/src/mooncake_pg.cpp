@@ -544,7 +544,8 @@ mooncakePgResult_t mooncakePgCommGetGpuCollectiveBackend(
 }
 
 // The status is allocated before submission and handed out only when the
-// operation actually uses NCCL. Legacy calls and TE operations stay untracked.
+// operation actually uses NCCL. Legacy calls and TE operations return no
+// handle.
 template <typename Function>
 static mooncakePgResult_t invokeCommOpWithGpuStatus(
     mooncakePgComm_t comm, mooncakePgGpuCollectiveStatus_t* status,
@@ -569,8 +570,7 @@ mooncakePgResult_t mooncakePgGpuCollectiveStatusGetAborted(
         PG_VALIDATE_ARG(status && status->impl,
                         "invalid GPU collective status");
         PG_VALIDATE_ARG(aborted, "abort-status output is null");
-        *aborted =
-            status->impl->aborted.load(std::memory_order_acquire) ? 1 : 0;
+        *aborted = status->impl->isAborted() ? 1 : 0;
         return {};
     });
 }
@@ -1143,7 +1143,8 @@ mooncakePgResult_t mooncakePgCommSyncAfterFailure(
     return asCApiResult([&]() -> PGResult<void> {
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(response, "sync response is null");
-        PG_TRY(auto sync_response, comm->impl->syncAfterFailure());
+        PG_TRY(auto sync_response,
+               comm->impl->syncAfterFailure(/*recover_nccl=*/true));
         std::memset(response, 0, sizeof(*response));
         response->status = static_cast<mooncakePgSyncAfterFailureStatus_t>(
             sync_response.status);

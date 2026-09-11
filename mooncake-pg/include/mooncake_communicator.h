@@ -38,7 +38,7 @@ static constexpr int64_t kDefaultFaultReconciliationWindowUs =
 
 struct MooncakePGContext {
     std::string host_ip = "127.0.0.1";
-    size_t collective_timeout_us = kDefaultCollectiveTimeoutUs;
+    std::atomic<size_t> collective_timeout_us{kDefaultCollectiveTimeoutUs};
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
@@ -126,6 +126,10 @@ class MooncakeCommunicator {
     int getMaxGroupSize() const { return max_group_size_; }
     bool isCpu() const { return is_cpu_; }
     GpuCollectiveBackend getGpuCollectiveBackend() const;
+    // Agent-only callbacks. NCCL failure reporting does not alter membership
+    // or switch the selected backend; notification is applied asynchronously.
+    std::optional<NcclCollectiveFailure> getNcclFailure() const;
+    void onNcclFailure(const NcclCollectiveFailure& failure);
 
     PGResult<std::unique_ptr<WorkCompletion>> sendCpu(
         const void* buffer, size_t count, DataType datatype, int peer,
@@ -239,7 +243,10 @@ class MooncakeCommunicator {
 
     // Notify the Coordinator of a detected failure and block until a membership
     // decision has been made and the Agent has ACKed the resulting ViewUpdate.
-    PGResult<SyncAfterFailureResponse> syncAfterFailure();
+    // Worker-driven TE reconciliation must never enter the application-level
+    // NCCL barrier (the worker may itself be one of the tasks being drained).
+    PGResult<SyncAfterFailureResponse> syncAfterFailure(
+        bool recover_nccl = false);
 
     // Update the data-plane view. Called by AgentHost when a ViewUpdatePush is
     // received or rank states change. rank_states and activatable are computed
@@ -324,6 +331,8 @@ class MooncakeCommunicator {
 
     // Optional NCCL executor for GPU collectives. P2P remains on TE.
     std::unique_ptr<NcclCollectiveExecutor> nccl_collectives_;
+    std::mutex nccl_recovery_mutex_;
+    std::atomic<bool> nccl_recovery_pending_{false};
 };
 
 }  // namespace mooncake

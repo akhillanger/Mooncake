@@ -13,8 +13,10 @@
 namespace mooncake {
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
-    int max_world_size, std::chrono::microseconds fault_reconciliation_window)
+    int max_world_size, std::chrono::microseconds fault_reconciliation_window,
+    std::chrono::milliseconds nccl_recovery_timeout)
     : max_world_size_(max_world_size),
+      nccl_recovery_timeout_(nccl_recovery_timeout),
       fault_reconciliation_window_(fault_reconciliation_window) {
     PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
               "invalid max_world_size: ", max_world_size_);
@@ -182,7 +184,47 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     }
     auto& info = ranks_[req.rank];
     info.last_heartbeat = std::chrono::steady_clock::now();
+
+    for (const auto& failure : req.nccl_failures) {
+        recordNcclFailure(req.rank, failure);
+    }
+    // Do not open TE reconciliation, demote a rank, or advance a view epoch:
+    // an NCCL error is a group failure, not a peer connectivity observation.
+    for (const auto& [group_id, failure] : nccl_failures_) {
+        if (group_views_.at(group_id).members[req.rank].isActive()) {
+            result.response.nccl_failures.push_back(failure);
+        }
+    }
     return result;
+}
+
+bool CentralizedCoordinatorStateMachine::recordNcclFailure(
+    GlobalRank rank, const NcclCollectiveFailure& failure) {
+    const auto it = group_views_.find(failure.group_id);
+    if (it == group_views_.end()) return false;
+    const auto& view = it->second;
+    if (view.status != GroupStatus::Ready || view.rank_order.empty())
+        return false;
+    const auto& reporter = view.members[rank];
+    const auto& root = view.members[view.rank_order.front()];
+    if (!reporter.isActive() || !reporter.endpoint ||
+        !reporter.endpoint->nccl_collectives_enabled || !root.endpoint ||
+        !root.endpoint->nccl_collectives_enabled ||
+        root.endpoint->nccl_unique_id_size != kNcclUniqueIdBytes ||
+        root.endpoint->nccl_unique_id != failure.unique_id)
+        return false;
+    auto [latched, inserted] =
+        nccl_failures_.try_emplace(failure.group_id, failure);
+    if (!inserted) {
+        if (latched->second.unique_id != failure.unique_id) {
+            latched->second = failure;
+        } else {
+            latched->second.first_failed_operation =
+                std::min(latched->second.first_failed_operation,
+                         failure.first_failed_operation);
+        }
+    }
+    return true;
 }
 
 CoordinatorApplyResult<UnregisterAgentResponse>
@@ -506,6 +548,12 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
             processLinkEventReport(*req.link_event_report, result.effects);
     }
 
+    if (req.nccl_recovery) {
+        handleNcclRecovery(sync_id, req, std::move(link_event_report_ack),
+                           result.effects);
+        return result;
+    }
+
     if (reconciliation_ctx_.active) {
         reconciliation_ctx_.pending_syncs[req.group_id][req.reporter_rank]
             .push_back(PendingSync{sync_id, req.agent_session_id,
@@ -521,6 +569,118 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     response.link_event_report_ack = std::move(link_event_report_ack);
     result.effects.push_back(ReplySync{sync_id, std::move(response)});
     return result;
+}
+
+void CentralizedCoordinatorStateMachine::handleNcclRecovery(
+    uint64_t sync_id, const SyncAfterFailureRequest& req,
+    std::optional<LinkEventReportAck> link_ack,
+    std::vector<CoordinatorEffect>& effects) {
+    progressNcclRecoveries(effects);
+    const auto& recovery = *req.nccl_recovery;
+    const auto& view = group_views_.at(req.group_id);
+    if (recovery.failure.group_id != req.group_id ||
+        recovery.epoch != req.current_epoch || view.epoch != recovery.epoch ||
+        recovery.te_task_count < 0 || reconciliation_ctx_.active ||
+        !recordNcclFailure(req.reporter_rank, recovery.failure)) {
+        auto response =
+            makeSyncResponse(SyncAfterFailureStatus::Rejected, req.group_id);
+        response.link_event_report_ack = std::move(link_ack);
+        response.reject_reason =
+            "stale NCCL recovery generation/view or TE reconciliation pending";
+        effects.push_back(ReplySync{sync_id, std::move(response)});
+        return;
+    }
+
+    auto [it, inserted] = nccl_recoveries_.try_emplace(req.group_id);
+    auto& state = it->second;
+    if (inserted) {
+        state.request = recovery;
+        state.deadline =
+            std::chrono::steady_clock::now() + nccl_recovery_timeout_;
+        for (GlobalRank rank : view.rank_order) {
+            if (view.members[rank].isActive())
+                state.sessions.emplace(rank, ranks_[rank].agent_session_id);
+        }
+    }
+    if (state.request.te_task_count != recovery.te_task_count) {
+        // Never reset TE's double-buffer sequence underneath existing work.
+        // Reject the entire attempt; callers must establish a common boundary.
+        auto response =
+            makeSyncResponse(SyncAfterFailureStatus::Rejected, req.group_id);
+        response.reject_reason =
+            "NCCL recovery requires matching drained TE task counts";
+        for (const auto& pending : state.pending) {
+            response.link_event_report_ack = pending.link_event_report_ack;
+            effects.push_back(ReplySync{pending.sync_id, response});
+        }
+        response.link_event_report_ack = std::move(link_ack);
+        effects.push_back(ReplySync{sync_id, std::move(response)});
+        // A committed decision cannot be revoked by a malformed retry.
+        if (!state.committed) nccl_recoveries_.erase(it);
+        return;
+    }
+    state.arrived.insert(req.reporter_rank);
+    state.pending.push_back(
+        {sync_id, req.agent_session_id, std::move(link_ack)});
+    progressNcclRecoveries(effects);
+}
+
+void CentralizedCoordinatorStateMachine::progressNcclRecoveries(
+    std::vector<CoordinatorEffect>& effects) {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = nccl_recoveries_.begin(); it != nccl_recoveries_.end();) {
+        const auto& group_id = it->first;
+        auto& state = it->second;
+        const auto view_it = group_views_.find(group_id);
+        const char* rejection = nullptr;
+        if (view_it == group_views_.end() ||
+            view_it->second.epoch != state.request.epoch) {
+            rejection = "group or membership view changed during NCCL recovery";
+        } else {
+            const auto& view = view_it->second;
+            const auto& root = view.members[view.rank_order.front()].endpoint;
+            if (!root ||
+                root->nccl_unique_id != state.request.failure.unique_id)
+                rejection = "NCCL generation changed during recovery";
+            for (const auto& [rank, session] : state.sessions) {
+                if (!hasValidSession(rank, session) ||
+                    ranks_[rank].state != RankState::Healthy ||
+                    !view.members[rank].isActive()) {
+                    rejection =
+                        "NCCL recovery participant changed or is not healthy";
+                }
+            }
+        }
+        if (!state.committed && reconciliation_ctx_.active)
+            rejection = "TE reconciliation started during NCCL recovery";
+        if (!state.committed && now >= state.deadline)
+            rejection = "NCCL recovery timed out waiting for all active ranks";
+
+        if (!rejection && state.arrived.size() == state.sessions.size())
+            state.committed = true;
+        if (rejection || state.committed) {
+            for (const auto& pending : state.pending) {
+                auto response = makeSyncResponse(
+                    rejection ? SyncAfterFailureStatus::Rejected
+                              : SyncAfterFailureStatus::Reconciled,
+                    group_id);
+                response.link_event_report_ack = pending.link_event_report_ack;
+                if (rejection) {
+                    response.reject_reason = rejection;
+                } else {
+                    response.nccl_recovery = nccl_failures_.at(group_id);
+                }
+                effects.push_back(
+                    ReplySync{pending.sync_id, std::move(response)});
+            }
+            state.pending.clear();
+        }
+        if (rejection) {
+            it = nccl_recoveries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // handleViewUpdateAck - unified ACK handler for all ViewUpdate pushes.
@@ -605,6 +765,7 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
     }
 
     tryCloseReconciliationWindow(result.effects);
+    progressNcclRecoveries(result.effects);
 
     // A proposal may have been waiting for link readiness, rank state, or the
     // preceding membership barrier. Iterate over a snapshot because admission
@@ -746,6 +907,10 @@ void CentralizedCoordinatorStateMachine::tryConfirmShutdown(
     }
     reconciliation_ctx_.pending_syncs.clear();
     reconciliation_ctx_.active = false;
+
+    // All registered sessions have ended, so this rejects and clears any
+    // application recovery barriers before the Host stops serving replies.
+    progressNcclRecoveries(effects);
 
     shutdown_confirmed_ = true;
     effects.push_back(ShutdownCoordinatorHost{});
@@ -1495,7 +1660,9 @@ void CentralizedCoordinatorStateMachine::eraseGroup(
         group_ids_by_bootstrap_id_.erase(group_bootstrap_id);
     }
     group_bootstrap_ids_.erase(group_id);
+    nccl_failures_.erase(group_id);
     group_views_.erase(group_id);
+    progressNcclRecoveries(effects);
 }
 
 // Effect factories

@@ -19,8 +19,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <mutex>
 #include <memory>
+#include <optional>
+#include <thread>
 #include <vector>
 
 #include "comm_types.h"
@@ -46,10 +49,18 @@ class NcclCollectiveExecutor {
     static PGResult<UniqueId> createUniqueId();
 
     PGResult<void> initialize(const UniqueId& unique_id, int rank, int size,
-                              int device_index);
+                              int device_index,
+                              const std::atomic<size_t>* timeout_us);
     bool isActive() const noexcept {
         return active_.load(std::memory_order_acquire);
     }
+    std::optional<NcclCollectiveFailure> failedGeneration() const noexcept;
+    // Called by the Agent, including while idle. Queue the abort for the
+    // watchdog so NCCL teardown cannot block the Agent's heartbeat executor.
+    void requestGroupAbort(const NcclCollectiveFailure& failure) noexcept;
+    // Wait for abort completion without enabling TE. The caller must stop new
+    // submissions and release captured graphs before entering recovery.
+    PGResult<NcclCollectiveFailure> quiesceForRecovery();
     bool supports(DataType datatype) const noexcept;
     bool supportsReduction(DataType datatype, ReduceOp op) const noexcept;
 
@@ -102,12 +113,33 @@ class NcclCollectiveExecutor {
     struct PendingOperation;
     // Called with mutex_ held. Never query events belonging to captured work.
     void retireCompletedOperations() noexcept;
-    void markPendingOperationsAborted() noexcept;
+    uint64_t markPendingOperationsAborted() noexcept;
+    void abortLocked(const char* reason,
+                     PGErrorCode code = PGErrorCode::SystemError,
+                     bool report_failure = true) noexcept;
+    void watchdogLoop() noexcept;
     std::vector<std::unique_ptr<PendingOperation>> pending_operations_;
 
+    // Serialize submissions across waits for nonblocking NCCL enqueue. The
+    // watchdog/disable use only mutex_, so they can interrupt those waits.
+    std::mutex launch_mutex_;
     mutable std::mutex mutex_;
+    std::condition_variable progress_;
+    std::thread watchdog_;
+    const std::atomic<size_t>* timeout_us_ = nullptr;
+    const char* failure_reason_ = nullptr;
+    PGErrorCode failure_code_ = PGErrorCode::SystemError;
     std::atomic<bool> active_{false};
+    // Written once before generation_ready_ is published; never reused.
+    UniqueId unique_id_{};
+    std::atomic<bool> generation_ready_{false};
+    std::shared_ptr<GpuCollectiveFailureState> failure_state_ =
+        std::make_shared<GpuCollectiveFailureState>();
+    uint64_t next_operation_ = 0;  // protected by mutex_
+    std::atomic<bool> failed_{false};
+    std::atomic<bool> group_abort_requested_{false};
     void* communicator_ = nullptr;
+    bool abort_succeeded_ = false;  // protected by mutex_
     void* barrier_buffer_ = nullptr;
     int device_index_ = -1;
     int size_ = 0;

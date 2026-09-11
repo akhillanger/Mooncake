@@ -75,7 +75,7 @@ struct TransferGroupMeta {
     TransferEngine* engine;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     GroupEndpointInfo segmentInfos[kMaxNumRanks];
-    const size_t* collectiveTimeoutUs = nullptr;
+    const std::atomic<size_t>* collectiveTimeoutUs = nullptr;
     MooncakeCommunicator* communicator = nullptr;
     bool autoSyncOnFailure = true;
 };

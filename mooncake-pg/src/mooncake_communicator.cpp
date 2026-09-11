@@ -650,9 +650,9 @@ PGResult<void> MooncakeCommunicator::initialize(
             PG_VALIDATE_STATE(
                 root_endpoint.nccl_unique_id_size == kNcclUniqueIdBytes,
                 "group root did not publish a valid NCCL bootstrap token");
-            PG_TRY(nccl_collectives_->initialize(root_endpoint.nccl_unique_id,
-                                                 rank_, initial_size_,
-                                                 device_index_));
+            PG_TRY(nccl_collectives_->initialize(
+                root_endpoint.nccl_unique_id, rank_, initial_size_,
+                device_index_, &context_.collective_timeout_us));
             bool initial_membership = getSize() == initial_size_;
             for (int local_rank = 0; local_rank < max_group_size_;
                  ++local_rank) {
@@ -701,6 +701,23 @@ GpuCollectiveBackend MooncakeCommunicator::getGpuCollectiveBackend() const {
     return GpuCollectiveBackend::TransferEngine;
 }
 
+std::optional<NcclCollectiveFailure> MooncakeCommunicator::getNcclFailure()
+    const {
+    if (nccl_collectives_) {
+        if (auto failure = nccl_collectives_->failedGeneration()) {
+            failure->group_id = meta_->group_id;
+            return failure;
+        }
+    }
+    return std::nullopt;
+}
+
+void MooncakeCommunicator::onNcclFailure(const NcclCollectiveFailure& failure) {
+    if (nccl_collectives_ && failure.group_id == meta_->group_id) {
+        nccl_collectives_->requestGroupAbort(failure);
+    }
+}
+
 PGResult<void> MooncakeCommunicator::checkOpState(OpType op) const {
     PG_VALIDATE_STATE(!is_shutdown_, "communicator is shut down");
     PG_ASSERT(meta_, "initialized communicator has no group metadata");
@@ -715,6 +732,10 @@ PGResult<void> MooncakeCommunicator::checkOpState(OpType op) const {
                       "rank is quiescing and cannot issue operations");
 
     const bool is_p2p = op == OpType::Send || op == OpType::Recv;
+    PG_VALIDATE_STATE(
+        is_p2p || !nccl_recovery_pending_.load(std::memory_order_acquire),
+        "NCCL recovery is pending; call sync_after_failure before issuing "
+        "collectives");
     if (is_p2p) {
         // P2P operations require an valid group
         PG_VALIDATE_STATE(isValidGroup(),
@@ -1636,9 +1657,52 @@ uint64_t MooncakeCommunicator::getCurrentEpoch() const {
     return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
 }
 
-PGResult<SyncAfterFailureResponse> MooncakeCommunicator::syncAfterFailure() {
+PGResult<SyncAfterFailureResponse> MooncakeCommunicator::syncAfterFailure(
+    bool recover_nccl) {
     PG_TRY(checkValidGroup("syncAfterFailure"));
-    return agent_.syncAfterFailure(meta_->group_id);
+    if (!recover_nccl ||
+        ((!nccl_collectives_ || !nccl_collectives_->isActive()) &&
+         !nccl_recovery_pending_.load(std::memory_order_acquire))) {
+        return agent_.syncAfterFailure(meta_->group_id);
+    }
+
+    std::unique_lock<std::mutex> lock(nccl_recovery_mutex_, std::try_to_lock);
+    PG_VALIDATE_STATE(lock.owns_lock(),
+                      "sync_after_failure is already running");
+    if (!nccl_collectives_ || !nccl_collectives_->isActive() ||
+        !getNcclFailure()) {
+        PG_TRY(auto response, agent_.syncAfterFailure(meta_->group_id));
+        if (response.status != SyncAfterFailureStatus::Rejected)
+            nccl_recovery_pending_.store(false, std::memory_order_release);
+        return response;
+    }
+
+    // Keep the gate latched on errors/timeouts. No rank may choose TE merely
+    // because its own sync failed; all ranks may retry the explicit barrier.
+    nccl_recovery_pending_.store(true, std::memory_order_release);
+    const auto epoch = getCurrentEpoch();
+    PG_TRY(auto failure, nccl_collectives_->quiesceForRecovery());
+    failure.group_id = meta_->group_id;
+    PG_VALIDATE_STATE(worker_->drainTasks(meta_.get()),
+                      "TE work has not drained for NCCL recovery");
+    PG_VALIDATE_STATE(getCurrentEpoch() == epoch,
+                      "group view changed while preparing NCCL recovery; retry "
+                      "sync_after_failure");
+    PG_TRY(auto response,
+           agent_.syncAfterFailure(
+               meta_->group_id,
+               NcclRecoveryRequest{failure, epoch, meta_->taskCount}));
+    if (response.status == SyncAfterFailureStatus::Rejected) return response;
+    PG_VALIDATE_STATE(
+        response.nccl_recovery &&
+            response.nccl_recovery->group_id == failure.group_id &&
+            response.nccl_recovery->unique_id == failure.unique_id &&
+            response.view.epoch == epoch && getCurrentEpoch() == epoch,
+        "NCCL recovery decision is stale; retry sync_after_failure");
+    nccl_collectives_->requestGroupAbort(*response.nccl_recovery);
+    nccl_collectives_->disable("coordinated NCCL recovery to Transfer Engine");
+    nccl_recovery_pending_.store(false, std::memory_order_release);
+    return response;
 }
 
 void MooncakeCommunicator::applyViewUpdate(

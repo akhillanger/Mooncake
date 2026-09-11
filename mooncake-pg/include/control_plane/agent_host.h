@@ -96,7 +96,8 @@ class AgentInterface {
     virtual void pushLinkEvent(const LinkEvent& event) = 0;
 
     virtual PGResult<SyncAfterFailureResponse> syncAfterFailure(
-        GroupId group_id) = 0;
+        GroupId group_id,
+        std::optional<NcclRecoveryRequest> nccl_recovery = std::nullopt) = 0;
 };
 
 class AgentHost;
@@ -161,7 +162,8 @@ class AgentHost : public AgentInterface {
     void pushLinkEvent(const LinkEvent& event) override;
 
     PGResult<SyncAfterFailureResponse> syncAfterFailure(
-        GroupId group_id) override;
+        GroupId group_id, std::optional<NcclRecoveryRequest> nccl_recovery =
+                              std::nullopt) override;
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStatePush push);
