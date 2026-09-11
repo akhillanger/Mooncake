@@ -24,6 +24,8 @@
 
 namespace mooncake {
 
+class NcclCollectiveExecutor;
+
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
 
@@ -36,10 +38,11 @@ static constexpr int64_t kDefaultFaultReconciliationWindowUs =
 
 struct MooncakePGContext {
     std::string host_ip = "127.0.0.1";
-    size_t collective_timeout_us = kDefaultCollectiveTimeoutUs;
+    std::atomic<size_t> collective_timeout_us{kDefaultCollectiveTimeoutUs};
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
+    GpuCollectiveBackend gpu_collective_backend = GpuCollectiveBackend::Auto;
 
     std::unique_ptr<TransferEngine> owned_engine =
         std::make_unique<TransferEngine>(true);
@@ -69,6 +72,7 @@ struct MooncakePGContext {
     PGResult<void> connectCoordinator(const std::string& coordinator_address);
     PGResult<void> setHostIp(std::string value);
     PGResult<void> setExternalEngine(TransferEngine* transfer_engine);
+    PGResult<void> setGpuCollectiveBackend(GpuCollectiveBackend backend);
     PGResult<void> setDeviceFilter(std::vector<std::string> filters);
     PGResult<void> setCollectiveTimeout(size_t timeout_us);
     PGResult<void> setP2PTimeout(int64_t timeout_us);
@@ -121,6 +125,11 @@ class MooncakeCommunicator {
     int getSize() const;
     int getMaxGroupSize() const { return max_group_size_; }
     bool isCpu() const { return is_cpu_; }
+    GpuCollectiveBackend getGpuCollectiveBackend() const;
+    // Agent-only callbacks. NCCL failure reporting does not alter membership
+    // or switch the selected backend; notification is applied asynchronously.
+    std::optional<NcclCollectiveFailure> getNcclFailure() const;
+    void onNcclFailure(const NcclCollectiveFailure& failure);
 
     PGResult<std::unique_ptr<WorkCompletion>> sendCpu(
         const void* buffer, size_t count, DataType datatype, int peer,
@@ -141,72 +150,80 @@ class MooncakeCommunicator {
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> broadcastGpu(const void* send_buffer, void* recv_buffer,
-                                size_t count, DataType datatype, int root,
-                                cudaStream_t stream, int32_t* failed_ranks_hint,
-                                size_t failed_ranks_hint_count);
+    PGResult<void> broadcastGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> allReduceCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, ReduceOp op, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> allReduceGpu(const void* send_buffer, void* recv_buffer,
-                                size_t count, DataType datatype, ReduceOp op,
-                                cudaStream_t stream, int32_t* failed_ranks_hint,
-                                size_t failed_ranks_hint_count);
+    PGResult<void> allReduceGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> allGatherCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> allGatherGpu(const void* send_buffer, void* recv_buffer,
-                                size_t count, DataType datatype,
-                                cudaStream_t stream, int32_t* failed_ranks_hint,
-                                size_t failed_ranks_hint_count);
+    PGResult<void> allGatherGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> reduceScatterCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, ReduceOp op, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> reduceScatterGpu(const void* send_buffer, void* recv_buffer,
-                                    size_t count, DataType datatype,
-                                    ReduceOp op, cudaStream_t stream,
-                                    int32_t* failed_ranks_hint,
-                                    size_t failed_ranks_hint_count);
+    PGResult<void> reduceScatterGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> allToAllCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> allToAllGpu(const void* send_buffer, void* recv_buffer,
-                               size_t count, DataType datatype,
-                               cudaStream_t stream, int32_t* failed_ranks_hint,
-                               size_t failed_ranks_hint_count);
+    PGResult<void> allToAllGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> barrierCpu(
         int32_t* failed_ranks_hint, size_t failed_ranks_hint_count);
-    PGResult<void> barrierGpu(cudaStream_t stream, int32_t* failed_ranks_hint,
-                              size_t failed_ranks_hint_count);
+    PGResult<void> barrierGpu(
+        cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> reduceCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, ReduceOp op, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> reduceGpu(const void* send_buffer, void* recv_buffer,
-                             size_t count, DataType datatype, ReduceOp op,
-                             int root, cudaStream_t stream,
-                             int32_t* failed_ranks_hint,
-                             size_t failed_ranks_hint_count);
+    PGResult<void> reduceGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> gatherCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> gatherGpu(const void* send_buffer, void* recv_buffer,
-                             size_t count, DataType datatype, int root,
-                             cudaStream_t stream, int32_t* failed_ranks_hint,
-                             size_t failed_ranks_hint_count);
+    PGResult<void> gatherGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
     PGResult<std::unique_ptr<WorkCompletion>> scatterCpu(
         const void* send_buffer, void* recv_buffer, size_t count,
         DataType datatype, int root, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
-    PGResult<void> scatterGpu(const void* send_buffer, void* recv_buffer,
-                              size_t count, DataType datatype, int root,
-                              cudaStream_t stream, int32_t* failed_ranks_hint,
-                              size_t failed_ranks_hint_count);
+    PGResult<void> scatterGpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, cudaStream_t stream,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+        std::shared_ptr<GpuCollectiveStatus>* status = nullptr);
 
     PGResult<void> shutdown();
     std::vector<int32_t> getActiveRanks() const;
@@ -226,7 +243,10 @@ class MooncakeCommunicator {
 
     // Notify the Coordinator of a detected failure and block until a membership
     // decision has been made and the Agent has ACKed the resulting ViewUpdate.
-    PGResult<SyncAfterFailureResponse> syncAfterFailure();
+    // Worker-driven TE reconciliation must never enter the application-level
+    // NCCL barrier (the worker may itself be one of the tasks being drained).
+    PGResult<SyncAfterFailureResponse> syncAfterFailure(
+        bool recover_nccl = false);
 
     // Update the data-plane view. Called by AgentHost when a ViewUpdatePush is
     // received or rank states change. rank_states and activatable are computed
@@ -308,6 +328,11 @@ class MooncakeCommunicator {
     // Created by P2PDeviceWorkerManager and shared between communicators on the
     // same device.
     std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
+
+    // Optional NCCL executor for GPU collectives. P2P remains on TE.
+    std::unique_ptr<NcclCollectiveExecutor> nccl_collectives_;
+    std::mutex nccl_recovery_mutex_;
+    std::atomic<bool> nccl_recovery_pending_{false};
 };
 
 }  // namespace mooncake

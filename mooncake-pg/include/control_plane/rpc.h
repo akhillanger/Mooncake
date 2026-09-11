@@ -17,6 +17,7 @@ namespace mooncake {
 
 inline constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
 inline constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
+inline constexpr auto kNcclRecoveryTimeout = std::chrono::seconds(20);
 
 // Agent -> Coordinator RPC messages
 
@@ -72,10 +73,15 @@ struct LinkEventReportAck {
 struct HeartbeatRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_id = 0;
+    // Latched observations, repeated so a lost request cannot lose a failure.
+    std::vector<NcclCollectiveFailure> nccl_failures;
 };
 
 struct HeartbeatResponse {
     bool require_new_session = false;
+    // Authoritative, generation-scoped failures for this rank's groups.
+    // Repeated on subsequent heartbeats; delivery does not change membership.
+    std::vector<NcclCollectiveFailure> nccl_failures;
 };
 
 struct UnregisterAgentRequest {
@@ -164,6 +170,14 @@ struct UnregisterGroupResponse {
     std::string reject_reason;
 };
 
+// Explicit application acknowledgement: NCCL abort has completed, old TE
+// collectives have drained, and no new collectives will be issued until commit.
+struct NcclRecoveryRequest {
+    NcclCollectiveFailure failure;
+    uint64_t epoch = 0;
+    int te_task_count = 0;
+};
+
 struct SyncAfterFailureRequest {
     GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
@@ -171,12 +185,13 @@ struct SyncAfterFailureRequest {
     uint64_t current_epoch = 0;
     // Piggybacked link event report.
     std::optional<LinkEventReport> link_event_report;
+    std::optional<NcclRecoveryRequest> nccl_recovery;
 };
 
 enum class SyncAfterFailureStatus : uint8_t {
-    Reconciled = 0,  // A reconciliation window completed.
+    Reconciled = 0,  // Reconciliation or an explicit NCCL recovery completed.
     NoPending = 1,   // No reconciliation was pending at request time.
-    Rejected = 2,    // Invalid request (stale session, group not found).
+    Rejected = 2,    // Invalid request, or NCCL recovery could not commit.
 };
 
 struct SyncAfterFailureResponse {
@@ -185,6 +200,9 @@ struct SyncAfterFailureResponse {
     // Piggybacked link event report ack.
     std::optional<LinkEventReportAck> link_event_report_ack;
     std::string reject_reason;
+    // Present only after every active rank acknowledged the same generation,
+    // view, and TE sequence. Authorizes local fallback, not NCCL recreation.
+    std::optional<NcclCollectiveFailure> nccl_recovery;
 };
 
 // Coordinator -> Agent RPC messages

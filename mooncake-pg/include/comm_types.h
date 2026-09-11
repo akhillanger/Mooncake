@@ -1,10 +1,13 @@
 #ifndef MOONCAKE_PG_COMM_TYPES_H
 #define MOONCAKE_PG_COMM_TYPES_H
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <limits>
+#include <memory>
 #include <utility>
 
 #include "error_types.h"
@@ -82,6 +85,45 @@ enum class ReduceOp : uint8_t {
     Product = 2,
     Min = 3,
     Max = 4,
+};
+
+// Process-wide selection for GPU collective execution. Point-to-point and CPU
+// operations continue to use Transfer Engine for every selection.
+enum class GpuCollectiveBackend : uint8_t {
+    Auto = 0,
+    TransferEngine = 1,
+    Nccl = 2,
+};
+
+// Shared by the Work objects of one NCCL communicator. A peer's abort can
+// release CUDA work before its failure notification arrives, so local event
+// completion cannot by itself preserve success for the affected collective.
+struct GpuCollectiveFailureState {
+    std::atomic<uint64_t> first_failed_operation{
+        std::numeric_limits<uint64_t>::max()};
+
+    void failFrom(uint64_t sequence) noexcept {
+        auto current = first_failed_operation.load(std::memory_order_acquire);
+        while (sequence < current &&
+               !first_failed_operation.compare_exchange_weak(
+                   current, sequence, std::memory_order_acq_rel)) {
+        }
+    }
+};
+
+// Independent of peer-failure hints: a collective may be aborted without
+// identifying a failed peer. Shared with Work objects after executor teardown.
+struct GpuCollectiveStatus {
+    std::atomic<bool> aborted{false};
+    std::shared_ptr<GpuCollectiveFailureState> failure_state;
+    uint64_t sequence = 0;
+
+    bool isAborted() const noexcept {
+        return aborted.load(std::memory_order_acquire) ||
+               (failure_state &&
+                sequence >= failure_state->first_failed_operation.load(
+                                std::memory_order_acquire));
+    }
 };
 
 class WorkCompletion {

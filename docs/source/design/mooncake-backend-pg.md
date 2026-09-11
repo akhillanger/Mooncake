@@ -308,9 +308,93 @@ caller-visible results are:
 Failure hints can differ across ranks. Workers submit such observations to the
 Coordinator instead of changing membership locally.
 
+With the optional NCCL collective backend, an aborted operation reports
+`local_success=false` even if its CUDA completion event has finished. Its
+`failed_ranks_hint` can remain all zeros because abort does not identify a
+failed peer. Use `get_local_success(work)` rather than deriving success from
+the bitmap. Earlier successful eager operations retain their outcome after
+communicator shutdown; captured NCCL work remains abort-sensitive because its graph can
+replay. Synchronize graph execution directly: host-side status queries on
+captured Work are not supported. A graph must not be replayed after its NCCL
+communicator is aborted. Release captured graphs before destroying the process
+group, since NCCL teardown waits for those graph references.
+The NCCL watchdog checks asynchronous errors and applies
+`set_collective_timeout_us()` to host enqueue and eager GPU completion. The
+deadline starts at host submission, including time queued behind earlier CUDA
+work; updates to the timeout also apply to outstanding operations. Captured
+graph replays do not have a per-replay deadline. NCCL must use nonblocking mode:
+leave `NCCL_COMM_BLOCKING` unset or set it to `0`.
+
+A local timeout or NCCL error aborts the communicator and rejects subsequent
+NCCL submissions. The Agent reports this failure through its existing heartbeat;
+the Coordinator then notifies active group members through their heartbeat
+responses. Both directions repeat the latched failure, so losing one request or
+response does not lose the notification. With a reachable Coordinator and
+responsive Agents, propagation normally takes up to two one-second heartbeat
+intervals plus RPC/scheduling time; this is not an instantaneous group barrier.
+Recipients abort the matching NCCL communicator even when they have no pending
+collective. The runtime group ID and NCCL bootstrap token identify the failed
+generation, preventing delayed notifications from aborting another group or a
+replacement communicator. Applying this notification queues teardown outside
+the Agent executor so that it does not stop heartbeats.
+
+Notifications also carry the earliest failed NCCL host-submission sequence.
+NCCL may release a peer's CUDA work before the notification arrives; the shared
+sequence cutoff therefore marks affected retained Work handles as failed even
+if their local events have finished. Earlier successful operations are not
+invalidated. Until notification arrives, a local completion is not a guarantee
+of group-wide success. This does not establish a globally acknowledged
+completion boundary or track individual CUDA graph replays.
+
+This notification preserves membership and does not identify a failed peer,
+trigger TE failure reconciliation, or switch the group to TE. A coordinated
+membership view change still enables the existing TE fallback. Delivery requires
+the existing Coordinator to remain available; there is no new Coordinator
+failover mechanism.
+
+#### Explicit NCCL recovery to TE
+
+After observing an NCCL communicator failure, the application can recover the
+same process group with `sync_after_failure(backend)`. All active ranks must
+call it, including ranks that had no outstanding NCCL operation. This is an
+application retry boundary, not an automatic switch in the heartbeat handler:
+
+1. Stop submitting operations on this group and agree which application
+   operation to retry. Finish any prior TE work and release captured graphs;
+   do not replay graphs from the failed NCCL communicator. Serialize recovery
+   with group operations and membership changes.
+2. Call `sync_after_failure` on every active rank. Each rank waits for its NCCL
+   abort to finish and drains the group's TE worker tasks before acknowledging
+   readiness. The Coordinator requires the same communicator generation, view,
+   live Agent sessions, and TE task counter on all participants. TE counters
+   are preserved, not reset. Recovery does not change rank health or membership.
+3. On `Reconciled`, confirm `get_gpu_collective_backend(backend)` returns
+   `"transfer_engine"`, then retry with valid input buffers. NCCL failures may
+   leave outputs partially modified; Mooncake does not restore inputs or replay
+   failed collectives. The group stays on TE for its remaining lifetime.
+
+An NCCL recovery barrier has a 20-second Coordinator deadline from the first
+acknowledgement. A missing participant, changed view/session, concurrent TE
+reconciliation, or mismatched TE task counter rejects recovery. A rejected call
+or RPC error never authorizes local fallback; new collectives remain blocked
+on a rank that entered recovery. All ranks can retry, and a lost commit response
+can be retried without requiring already-committed peers to enter again. The
+deadline bounds the Coordinator barrier, not a stuck CUDA driver or NCCL abort.
+
+`NoPending` before a rank has observed the NCCL failure notification is not a
+recovery commit. Do not resume based on that status alone; wait for notification
+and retry the synchronization. Calls on healthy NCCL groups and TE groups retain
+the existing reconciliation behavior. TE workers do not enter this NCCL barrier
+automatically, so `auto_sync_on_failure` does not yet provide the same automatic
+recovery guarantee for NCCL operations as it does for TE operations.
+
+This supports eager recovery when all current members and the Coordinator are
+reachable. It does not rebuild NCCL, provide partial results from surviving
+ranks, recover a failed CUDA context, or make old CUDA graphs replayable.
+
 #### Reconciliation and `sync_after_failure`
 
-Negative evidence opens a reconciliation window in the Coordinator, allowing
+For TE failures, negative evidence opens a reconciliation window in the Coordinator, allowing
 reports from different ranks to arrive before a single decision is made. The
 window is 30 seconds by default and must be configured to exceed the default
 collective timeout. When the window closes, the Coordinator derives the

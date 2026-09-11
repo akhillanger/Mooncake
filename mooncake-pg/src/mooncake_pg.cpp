@@ -36,6 +36,10 @@ struct mooncakePgComm {
     std::unique_ptr<MooncakeCommunicator> impl;
 };
 
+struct mooncakePgGpuCollectiveStatus {
+    std::shared_ptr<GpuCollectiveStatus> impl;
+};
+
 struct mooncakePgCompletion {
     std::unique_ptr<WorkCompletion> impl;
 };
@@ -389,6 +393,29 @@ mooncakePgResult_t mooncakePgContextSetTransferEngine(
     });
 }
 
+mooncakePgResult_t mooncakePgContextSetGpuCollectiveBackend(
+    mooncakePgContext_t context, mooncakePgGpuCollectiveBackend_t backend) {
+    return asCApiResult([&]() -> PGResult<void> {
+        PG_VALIDATE_ARG(context && context->impl, "invalid context");
+        GpuCollectiveBackend converted;
+        switch (backend) {
+            case mooncakePgGpuCollectiveAuto:
+                converted = GpuCollectiveBackend::Auto;
+                break;
+            case mooncakePgGpuCollectiveTransferEngine:
+                converted = GpuCollectiveBackend::TransferEngine;
+                break;
+            case mooncakePgGpuCollectiveNccl:
+                converted = GpuCollectiveBackend::Nccl;
+                break;
+            default:
+                return makePGError(PGErrorCode::InvalidArgument,
+                                   "invalid GPU collective backend");
+        }
+        return context->impl->setGpuCollectiveBackend(converted);
+    });
+}
+
 mooncakePgResult_t mooncakePgContextSetDeviceFilter(mooncakePgContext_t context,
                                                     const char* const* filters,
                                                     size_t filter_count) {
@@ -497,6 +524,63 @@ mooncakePgResult_t mooncakePgCommGetMaxGroupSize(mooncakePgComm_t comm,
     });
 }
 
+mooncakePgResult_t mooncakePgCommGetGpuCollectiveBackend(
+    mooncakePgComm_t comm, mooncakePgGpuCollectiveBackend_t* backend) {
+    return asCApiResult([&]() -> PGResult<void> {
+        PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
+        PG_VALIDATE_ARG(backend, "GPU collective backend output is null");
+        switch (comm->impl->getGpuCollectiveBackend()) {
+            case GpuCollectiveBackend::TransferEngine:
+                *backend = mooncakePgGpuCollectiveTransferEngine;
+                break;
+            case GpuCollectiveBackend::Nccl:
+                *backend = mooncakePgGpuCollectiveNccl;
+                break;
+            case GpuCollectiveBackend::Auto:
+                PG_ASSERT(false, "communicator returned unresolved backend");
+        }
+        return {};
+    });
+}
+
+// The status is allocated before submission and handed out only when the
+// operation actually uses NCCL. Legacy calls and TE operations return no
+// handle.
+template <typename Function>
+static mooncakePgResult_t invokeCommOpWithGpuStatus(
+    mooncakePgComm_t comm, mooncakePgGpuCollectiveStatus_t* status,
+    Function&& function) {
+    if (status) *status = nullptr;
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            if (!status ||
+                impl.getGpuCollectiveBackend() != GpuCollectiveBackend::Nccl) {
+                return function(impl, nullptr);
+            }
+            auto handle = std::make_unique<mooncakePgGpuCollectiveStatus>();
+            PG_TRY(function(impl, &handle->impl));
+            if (handle->impl) *status = handle.release();
+            return {};
+        });
+}
+
+mooncakePgResult_t mooncakePgGpuCollectiveStatusGetAborted(
+    mooncakePgGpuCollectiveStatus_t status, int* aborted) {
+    return asCApiResult([&]() -> PGResult<void> {
+        PG_VALIDATE_ARG(status && status->impl,
+                        "invalid GPU collective status");
+        PG_VALIDATE_ARG(aborted, "abort-status output is null");
+        *aborted = status->impl->isAborted() ? 1 : 0;
+        return {};
+    });
+}
+
+mooncakePgResult_t mooncakePgGpuCollectiveStatusDestroy(
+    mooncakePgGpuCollectiveStatus_t status) {
+    delete status;
+    return mooncakePgSuccess;
+}
+
 mooncakePgResult_t mooncakePgBroadcastGpu(const void* send_buffer,
                                           void* recv_buffer, size_t count,
                                           mooncakePgDataType_t data_type,
@@ -504,13 +588,26 @@ mooncakePgResult_t mooncakePgBroadcastGpu(const void* send_buffer,
                                           mooncakePgStream_t stream,
                                           int32_t* failed_ranks_hint,
                                           size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgBroadcastGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, root, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgBroadcastGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, int root, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count, mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             return impl.broadcastGpu(send_buffer, recv_buffer, count,
                                      converted_data_type, root,
                                      convertStream(stream), failed_ranks_hint,
-                                     failed_ranks_hint_count);
+                                     failed_ranks_hint_count, tracked_status);
         });
 }
 
@@ -519,14 +616,28 @@ mooncakePgResult_t mooncakePgAllReduceGpu(
     mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op,
     mooncakePgComm_t comm, mooncakePgStream_t stream,
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgAllReduceGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, reduce_op, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgAllReduceGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op,
+    mooncakePgComm_t comm, mooncakePgStream_t stream,
+    int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+    mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
             return impl.allReduceGpu(send_buffer, recv_buffer, count,
                                      converted_data_type, converted_reduce_op,
                                      convertStream(stream), failed_ranks_hint,
-                                     failed_ranks_hint_count);
+                                     failed_ranks_hint_count, tracked_status);
         });
 }
 
@@ -537,13 +648,26 @@ mooncakePgResult_t mooncakePgAllGatherGpu(const void* send_buffer,
                                           mooncakePgStream_t stream,
                                           int32_t* failed_ranks_hint,
                                           size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgAllGatherGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgAllGatherGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count, mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             return impl.allGatherGpu(send_buffer, recv_buffer, count,
                                      converted_data_type, convertStream(stream),
-                                     failed_ranks_hint,
-                                     failed_ranks_hint_count);
+                                     failed_ranks_hint, failed_ranks_hint_count,
+                                     tracked_status);
         });
 }
 
@@ -552,14 +676,28 @@ mooncakePgResult_t mooncakePgReduceScatterGpu(
     mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op,
     mooncakePgComm_t comm, mooncakePgStream_t stream,
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgReduceScatterGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, reduce_op, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgReduceScatterGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op,
+    mooncakePgComm_t comm, mooncakePgStream_t stream,
+    int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+    mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
             return impl.reduceScatterGpu(
                 send_buffer, recv_buffer, count, converted_data_type,
                 converted_reduce_op, convertStream(stream), failed_ranks_hint,
-                failed_ranks_hint_count);
+                failed_ranks_hint_count, tracked_status);
         });
 }
 
@@ -570,12 +708,26 @@ mooncakePgResult_t mooncakePgAllToAllGpu(const void* send_buffer,
                                          mooncakePgStream_t stream,
                                          int32_t* failed_ranks_hint,
                                          size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgAllToAllGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgAllToAllGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count, mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             return impl.allToAllGpu(send_buffer, recv_buffer, count,
                                     converted_data_type, convertStream(stream),
-                                    failed_ranks_hint, failed_ranks_hint_count);
+                                    failed_ranks_hint, failed_ranks_hint_count,
+                                    tracked_status);
         });
 }
 
@@ -584,14 +736,28 @@ mooncakePgResult_t mooncakePgReduceGpu(
     mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op, int root,
     mooncakePgComm_t comm, mooncakePgStream_t stream,
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgReduceGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, reduce_op, root, comm,
+        stream, failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgReduceGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op, int root,
+    mooncakePgComm_t comm, mooncakePgStream_t stream,
+    int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+    mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
-            return impl.reduceGpu(send_buffer, recv_buffer, count,
-                                  converted_data_type, converted_reduce_op,
-                                  root, convertStream(stream),
-                                  failed_ranks_hint, failed_ranks_hint_count);
+            return impl.reduceGpu(
+                send_buffer, recv_buffer, count, converted_data_type,
+                converted_reduce_op, root, convertStream(stream),
+                failed_ranks_hint, failed_ranks_hint_count, tracked_status);
         });
 }
 
@@ -602,13 +768,26 @@ mooncakePgResult_t mooncakePgGatherGpu(const void* send_buffer,
                                        mooncakePgStream_t stream,
                                        int32_t* failed_ranks_hint,
                                        size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgGatherGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, root, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgGatherGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, int root, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count, mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             return impl.gatherGpu(send_buffer, recv_buffer, count,
                                   converted_data_type, root,
                                   convertStream(stream), failed_ranks_hint,
-                                  failed_ranks_hint_count);
+                                  failed_ranks_hint_count, tracked_status);
         });
 }
 
@@ -619,13 +798,26 @@ mooncakePgResult_t mooncakePgScatterGpu(const void* send_buffer,
                                         mooncakePgStream_t stream,
                                         int32_t* failed_ranks_hint,
                                         size_t failed_ranks_hint_count) {
-    return invokeCommOp(
-        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+    return mooncakePgScatterGpuWithStatus(
+        send_buffer, recv_buffer, count, data_type, root, comm, stream,
+        failed_ranks_hint, failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgScatterGpuWithStatus(
+    const void* send_buffer, void* recv_buffer, size_t count,
+    mooncakePgDataType_t data_type, int root, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count, mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status)
+            -> PGResult<void> {
             PG_TRY(auto converted_data_type, convertDataType(data_type));
             return impl.scatterGpu(send_buffer, recv_buffer, count,
                                    converted_data_type, root,
                                    convertStream(stream), failed_ranks_hint,
-                                   failed_ranks_hint_count);
+                                   failed_ranks_hint_count, tracked_status);
         });
 }
 
@@ -633,10 +825,21 @@ mooncakePgResult_t mooncakePgBarrierGpu(mooncakePgComm_t comm,
                                         mooncakePgStream_t stream,
                                         int32_t* failed_ranks_hint,
                                         size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&](MooncakeCommunicator& impl) {
-        return impl.barrierGpu(convertStream(stream), failed_ranks_hint,
-                               failed_ranks_hint_count);
-    });
+    return mooncakePgBarrierGpuWithStatus(comm, stream, failed_ranks_hint,
+                                          failed_ranks_hint_count, nullptr);
+}
+
+mooncakePgResult_t mooncakePgBarrierGpuWithStatus(
+    mooncakePgComm_t comm, mooncakePgStream_t stream,
+    int32_t* failed_ranks_hint, size_t failed_ranks_hint_count,
+    mooncakePgGpuCollectiveStatus_t* status) {
+    return invokeCommOpWithGpuStatus(
+        comm, status,
+        [&](MooncakeCommunicator& impl,
+            std::shared_ptr<GpuCollectiveStatus>* tracked_status) {
+            return impl.barrierGpu(convertStream(stream), failed_ranks_hint,
+                                   failed_ranks_hint_count, tracked_status);
+        });
 }
 
 mooncakePgResult_t mooncakePgBroadcastCpu(const void* send_buffer,
@@ -940,7 +1143,8 @@ mooncakePgResult_t mooncakePgCommSyncAfterFailure(
     return asCApiResult([&]() -> PGResult<void> {
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(response, "sync response is null");
-        PG_TRY(auto sync_response, comm->impl->syncAfterFailure());
+        PG_TRY(auto sync_response,
+               comm->impl->syncAfterFailure(/*recover_nccl=*/true));
         std::memset(response, 0, sizeof(*response));
         response->status = static_cast<mooncakePgSyncAfterFailureStatus_t>(
             sync_response.status);

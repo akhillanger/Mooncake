@@ -387,15 +387,18 @@ void AgentHost::pushLinkEvent(const LinkEvent& event) {
 }
 
 PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
-    GroupId group_id) {
+    GroupId group_id, std::optional<NcclRecoveryRequest> nccl_recovery) {
     SyncAfterFailureRequest req;
     req.group_id = group_id;
+    req.nccl_recovery = std::move(nccl_recovery);
 
     PG_TRY(executor_.postAndWait([this, &req]() {
         req.reporter_rank = rank_;
         req.agent_session_id = agent_.getAgentSessionId();
         req.link_event_report = agent_.getLinkEventReport();
-        req.current_epoch = agent_.getGroupView(req.group_id).epoch;
+        req.current_epoch = req.nccl_recovery
+                                ? req.nccl_recovery->epoch
+                                : agent_.getGroupView(req.group_id).epoch;
     }));
 
     // Synchronous RPC should be issued outside the executor.
@@ -405,8 +408,13 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
         fault_reconciliation_window_us_.load(std::memory_order_relaxed));
     const auto reconciliation_timeout =
         std::chrono::ceil<std::chrono::milliseconds>(reconciliation_window);
-    const auto rpc_timeout =
+    auto rpc_timeout =
         std::max(RpcClient::kDefaultRequestTimeout, 2 * reconciliation_timeout);
+    if (req.nccl_recovery) {
+        rpc_timeout = std::max(
+            rpc_timeout, std::chrono::duration_cast<std::chrono::milliseconds>(
+                             2 * kNcclRecoveryTimeout));
+    }
     PG_TRY(auto response,
            rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
                coordinator_addr_, req, rpc_timeout));
@@ -600,6 +608,11 @@ void AgentHost::tick() {
 
     auto req = agent_.buildHeartbeat();
     req.agent_session_id = agent_.getAgentSessionId();
+    forEachCommunicator([&](auto communicator) {
+        if (auto failure = communicator->getNcclFailure()) {
+            req.nccl_failures.push_back(std::move(*failure));
+        }
+    });
     auto request_session = req.agent_session_id;
 
     rpc_client_->callAsync<&CoordinatorRpcService::heartbeat>(
@@ -613,6 +626,12 @@ void AgentHost::tick() {
                 if (resp.require_new_session) {
                     // The current session is no longer valid.
                     startAgentRegistration(/*start_new_session=*/true);
+                    return;
+                }
+                for (const auto& failure : resp.nccl_failures) {
+                    withCommunicator(failure.group_id, [&](auto communicator) {
+                        communicator->onNcclFailure(failure);
+                    });
                 }
             });
         });

@@ -142,6 +142,7 @@ add_library(
   gpu_runtime.cpp
   mooncake_communicator.cpp
   mooncake_pg.cpp
+  nccl_collective_executor.cpp
   mooncake_worker_host.cpp
   mooncake_worker_thread.cpp
   p2p_proxy.cpp)
@@ -151,6 +152,10 @@ target_include_directories(
   mooncake_pg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
                      $<INSTALL_INTERFACE:include>)
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
+
+if(USE_NCCL_PG)
+  target_link_libraries(mooncake_pg PRIVATE NCCL::nccl)
+endif()
 
 set_target_properties(
   mooncake_pg

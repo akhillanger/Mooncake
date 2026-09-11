@@ -25,6 +25,7 @@ extern "C" {
 typedef struct mooncakePgContext* mooncakePgContext_t;
 typedef struct mooncakePgComm* mooncakePgComm_t;
 typedef struct mooncakePgCompletion* mooncakePgCompletion_t;
+typedef struct mooncakePgGpuCollectiveStatus* mooncakePgGpuCollectiveStatus_t;
 typedef void* mooncakePgStream_t;
 
 /* Keep non-success entries synchronized with C++ PGErrorCode. */
@@ -79,6 +80,12 @@ typedef enum mooncakePgIdResolvePolicy {
     mooncakePgIdResolveCreateOrAttach = 0,
     mooncakePgIdResolveAttachOrExtend = 1,
 } mooncakePgIdResolvePolicy_t;
+
+typedef enum mooncakePgGpuCollectiveBackend {
+    mooncakePgGpuCollectiveAuto = 0,
+    mooncakePgGpuCollectiveTransferEngine = 1,
+    mooncakePgGpuCollectiveNccl = 2,
+} mooncakePgGpuCollectiveBackend_t;
 
 typedef struct mooncakePgCommConfig {
     size_t structSize;
@@ -165,6 +172,8 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgContextSetHostIp(mooncakePgContext_t context, const char* hostIp);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetTransferEngine(
     mooncakePgContext_t context, void* transferEngine);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetGpuCollectiveBackend(
+    mooncakePgContext_t context, mooncakePgGpuCollectiveBackend_t backend);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetDeviceFilter(
     mooncakePgContext_t context, const char* const* filters,
     size_t filterCount);
@@ -189,6 +198,8 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommGetSize(mooncakePgComm_t comm, int* size);
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommGetMaxGroupSize(mooncakePgComm_t comm, int* maxGroupSize);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommGetGpuCollectiveBackend(
+    mooncakePgComm_t comm, mooncakePgGpuCollectiveBackend_t* backend);
 
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgBroadcastGpu(const void* sendBuffer, void* recvBuffer, size_t count,
@@ -233,6 +244,67 @@ mooncakePgScatterGpu(const void* sendBuffer, void* recvBuffer, size_t count,
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgBarrierGpu(mooncakePgComm_t comm, mooncakePgStream_t stream,
                      int32_t* failedRanksHint, size_t failedRanksHintCount);
+
+/*
+ * Opt-in abort-status handles for GPU collectives. Existing entry points keep
+ * their signatures; these variants additionally return an owned status handle
+ * when the operation uses NCCL, or NULL for the TE path. An aborted NCCL
+ * operation may have an all-zero failedRanksHint: no peer is blamed without
+ * evidence. Use both the status handle and failedRanksHint after stream
+ * completion. Querying this handle does not wait for completion.
+ * A delayed peer-failure notification can still mark the affected operation
+ * aborted after its local CUDA event finishes; local completion is not a
+ * group-wide success acknowledgement. Earlier successful work is preserved.
+ * Captured NCCL work remains abort-sensitive for the communicator's lifetime,
+ * since a graph can replay. This does not make replay after abort safe.
+ */
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgBroadcastGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, int root, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgAllReduceGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, mooncakePgReduceOp_t reduceOp,
+    mooncakePgComm_t comm, mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgAllGatherGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgReduceScatterGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, mooncakePgReduceOp_t reduceOp,
+    mooncakePgComm_t comm, mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgAllToAllGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgReduceGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, mooncakePgReduceOp_t reduceOp, int root,
+    mooncakePgComm_t comm, mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgGatherGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, int root, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgScatterGpuWithStatus(
+    const void* sendBuffer, void* recvBuffer, size_t count,
+    mooncakePgDataType_t dataType, int root, mooncakePgComm_t comm,
+    mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgBarrierGpuWithStatus(
+    mooncakePgComm_t comm, mooncakePgStream_t stream, int32_t* failedRanksHint,
+    size_t failedRanksHintCount, mooncakePgGpuCollectiveStatus_t* status);
+MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgGpuCollectiveStatusGetAborted(
+    mooncakePgGpuCollectiveStatus_t status, int* aborted);
+MOONCAKE_PG_EXPORT mooncakePgResult_t
+mooncakePgGpuCollectiveStatusDestroy(mooncakePgGpuCollectiveStatus_t status);
 
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgBroadcastCpu(
     const void* sendBuffer, void* recvBuffer, size_t count,
@@ -315,6 +387,19 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommDeactivateRanks(
     mooncakePgComm_t comm, const int32_t* ranks, size_t rankCount,
     mooncakePgProposalResponse_t* response);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommJoin(mooncakePgComm_t comm);
+/**
+ * Reconcile TE failures, or explicitly recover an observed NCCL failure to TE.
+ * NCCL recovery requires every active rank (including idle ranks) to call this
+ * API at the same application retry boundary, after stopping new submissions,
+ * finishing prior TE work, and releasing captured graphs. Serialize this call
+ * with group operations and membership changes. It does not replay failed work.
+ * Reconciled authorizes TE fallback only after all ranks acknowledge the same
+ * failed generation/view and TE task sequence. A missing rank causes rejection
+ * after a 20-second coordinator deadline; rejection/RPC errors do not authorize
+ * local fallback. All ranks may retry. NoPending before the local NCCL failure
+ * notification arrives does not imply recovery: check the active backend.
+ * Worker-driven TE reconciliation retains its existing behavior.
+ */
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommSyncAfterFailure(
     mooncakePgComm_t comm, mooncakePgSyncAfterFailureResponse_t* response);
 MOONCAKE_PG_EXPORT mooncakePgResult_t
